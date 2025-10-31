@@ -92,6 +92,8 @@ class BirthDateParser:
             (r'(\d{1,2}):(\d{2})', 'time'),
             # รูปแบบ HH.MM เช่น 14.30, 2.30
             (r'(\d{1,2})\.(\d{2})', 'time'),
+            # รูปแบบ HH.MMน. เช่น 07.07น., 14.30น.
+            (r'(\d{1,2})\.(\d{2})น\.', 'time'),
             # รูปแบบ HH MM เช่น 14 30, 2 30
             (r'(\d{1,2})\s+(\d{2})', 'time'),
             # รูปแบบ เวลา X นาฬิกา Y นาที
@@ -421,6 +423,7 @@ class BirthDateParser:
             # ตรวจสอบราศีมังกร (ข้ามปี)
             if sign_key == 'capricorn':
                 if (month == 12 and day >= start_day) or (month == 1 and day <= end_day):
+                    logger.info(f"Matched Capricorn: day={day}, month={month}")
                     return {
                         'sign': sign_info['name'],
                         'element': sign_info['element'],
@@ -429,6 +432,7 @@ class BirthDateParser:
                     }
             else:
                 if (month == start_month and day >= start_day) or (month == end_month and day <= end_day):
+                    logger.info(f"Matched {sign_key}: day={day}, month={month}, range={start_month}/{start_day}-{end_month}/{end_day}")
                     return {
                         'sign': sign_info['name'],
                         'element': sign_info['element'],
@@ -436,6 +440,7 @@ class BirthDateParser:
                         'english_name': sign_key.title()
                     }
         
+        logger.warning(f"No zodiac match found for day={day}, month={month}")
         return None
 
     def generate_birth_chart_info(self, birth_date: str, birth_time: str = None, latitude: float = 13.7563, longitude: float = 100.5018) -> dict:
@@ -460,8 +465,10 @@ class BirthDateParser:
             
             # คำนวณราศี
             zodiac_info = self.calculate_zodiac_sign(day, month)
+            logger.info(f"Calculated zodiac for {day}/{month}: {zodiac_info}")
             
             if not zodiac_info:
+                logger.error(f"Failed to calculate zodiac for {day}/{month}")
                 return None
             
             # สร้าง birth_datetime
@@ -653,6 +660,17 @@ def get_zodiac_data_from_mongodb(zodiac_sign: str) -> dict:
         
         # ค้นหาข้อมูลราศี
         zodiac_data = collection.find_one({"zodiac_sign": zodiac_sign})
+        try:
+            if zodiac_data:
+                logger.info(
+                    f"📚 MongoDB source used for answer -> collection='zodiac_personality', _id={zodiac_data.get('_id')}, zodiac_sign={zodiac_sign}"
+                )
+            else:
+                logger.info(
+                    f"📚 MongoDB lookup -> collection='zodiac_personality', zodiac_sign={zodiac_sign}, result=None"
+                )
+        except Exception:
+            pass
         client.close()
         
         if zodiac_data:
@@ -840,12 +858,21 @@ def generate_birth_chart_prediction(message: str, user_id: str = "unknown") -> s
     # ใช้ RAG system เพื่อสร้างคำทำนาย
     try:
         from .retrieval_utils import ask_question_to_rag
-        prediction = ask_question_to_rag(enhanced_query, user_id)
+        prediction = ask_question_to_rag(enhanced_query, user_id, provided_chart_info=chart_info)
         
-        # เพิ่มข้อมูล Ascendant ในคำตอบถ้ามี
+        # เพิ่มข้อมูล Ascendant ในคำตอบถ้ามี และไม่ใช่ข้อความแจ้งเตือน
         if 'ascendant' in chart_info and prediction:
-            ascendant = chart_info['ascendant']
-            ascendant_info = f"""
+            # ตรวจสอบว่าเป็นข้อความแจ้งเตือนหรือไม่
+            is_error_message = (
+                prediction.startswith("ขออภัยค่ะ ระบบไม่พบข้อมูล") or
+                prediction.startswith("ขออภัยค่ะ ระบบไม่พบข้อมูลบริบท") or
+                prediction.startswith("ขออภัยค่ะ ระบบไม่พบข้อมูลราศี") or
+                prediction.startswith("ขออภัยครับ")  # คำสั่งจำกัดคำถาม
+            )
+            
+            if not is_error_message:
+                ascendant = chart_info['ascendant']
+                ascendant_info = f"""
 
 🌟 **ข้อมูลลัคณา (Ascendant)**
 ราศีลัคณา: {ascendant['sign']} {ascendant['degree']:.1f}°
@@ -853,11 +880,13 @@ def generate_birth_chart_prediction(message: str, user_id: str = "unknown") -> s
 คุณภาพ: {ascendant['quality']}
 
 {chart_info.get('ascendant_interpretation', '')}"""
-            
-            # เพิ่มข้อมูลลัคณาในคำตอบ
-            prediction += ascendant_info
-            
-            logger.info(f"✅ Added Ascendant info to response: {ascendant['sign']} {ascendant['degree']:.1f}°")
+                
+                # เพิ่มข้อมูลลัคณาในคำตอบ
+                prediction += ascendant_info
+                
+                logger.info(f"✅ Added Ascendant info to response: {ascendant['sign']} {ascendant['degree']:.1f}°")
+            else:
+                logger.info("⚠️ Skipped adding Ascendant info due to error message")
         
         return prediction
     except Exception as e:
@@ -904,7 +933,7 @@ def create_birth_chart_query(chart_info: dict, birth_info: dict) -> str:
         query += f"\n- เวลาเกิด: {birth_info['time']}"
     
     query += f"""
-- ราศีอาทิตย์: {chart_info['zodiac_sign']} ({chart_info['zodiac_element']})
+- ราศีเกิด: {chart_info['zodiac_sign']} ({chart_info['zodiac_element']})
 - สถานที่เกิด: {birth_info.get('location', 'กรุงเทพฯ')}"""
     
     # เพิ่มข้อมูล Ascendant ถ้ามี
@@ -917,7 +946,7 @@ def create_birth_chart_query(chart_info: dict, birth_info: dict) -> str:
 
 กรุณาสร้างคำทำนายดวงกำเนิดแบบละเอียดในรูปแบบ:
 1. หัวข้อ: "ทำนายดวงกำเนิด"
-2. วันเกิดและราศีอาทิตย์"""
+2. วันเกิดและราศีเกิด"""
     
     # เพิ่มข้อมูลลัคณาถ้ามี
     if 'ascendant' in chart_info:
@@ -932,10 +961,9 @@ def create_birth_chart_query(chart_info: dict, birth_info: dict) -> str:
 {section_start + 1}. ด้านการงาน
 {section_start + 2}. ด้านการเงิน
 {section_start + 3}. ด้านความรัก
-{section_start + 4}. ด้านสุขภาพ
-{section_start + 5}. สีมงคล
 
-ใช้ข้อมูลโหราศาสตร์ตะวันตกและข้อมูลในฐานข้อมูลเพื่อสร้างคำทำนายที่แม่นยำและละเอียด"""
+ใช้ข้อมูลโหราศาสตร์ตะวันตกและข้อมูลในฐานข้อมูลเพื่อสร้างคำทำนายที่แม่นยำและละเอียด
+**สำคัญ: ตอบเฉพาะ 4 ด้านเท่านั้น (ลักษณะนิสัย การงาน การเงิน ความรัก) ห้ามตอบเรื่องสุขภาพหรือสีมงคล**"""
     
     # เพิ่มคำแนะนำสำหรับลัคณาถ้ามี
     if 'ascendant' in chart_info:

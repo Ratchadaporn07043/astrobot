@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, time as dt_time
 from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
@@ -15,6 +15,93 @@ logger = logging.getLogger(__name__)
 
 # Import database configuration
 from config import SUMMARY_DB_NAME
+# ============================
+# Pretty Terminal Reporting
+# ============================
+def _print_divider(title: str):
+    print(f"\n== {title} ==")
+
+
+def print_ragas_terminal_report(
+    question: str,
+    retrieved_docs: list,
+    answer: str,
+    user_id: str = "unknown",
+):
+    """
+    แสดงผลสรุปบนเทอร์มินัลในรูปแบบอ่านง่าย เพื่อใช้ประกอบการประเมินด้วย RAGAS
+    - สรุปผลการค้นหาและจำนวนเอกสาร
+    - แหล่งที่มาพร้อม Similarity (ถ้ามี)
+    - ความยาวคำตอบจาก GPT
+    """
+    try:
+        # ตรวจสอบเอกสารที่มี similarity ต่ำเกินไปเพื่อแสดง warning
+        low_similarity_docs = []
+        valid_docs = []
+        
+        for doc in retrieved_docs:
+            if isinstance(doc, dict) and doc.get('below_threshold', False):
+                low_similarity_docs.append(doc)
+            else:
+                valid_docs.append(doc)
+        
+        # แสดง warning สำหรับเอกสารที่ต่ำกว่า threshold
+        if low_similarity_docs:
+            for idx, doc in enumerate(low_similarity_docs):
+                sim = doc.get("similarity", 0)
+                doc_num = len(valid_docs) + idx + 1
+                print(f"! เอกสารที่ {doc_num} มี similarity ต่ำเกินไป: {sim:.4f}")
+        
+        # สรุปผลการค้นหา
+        print("\n=== สรุปผลการค้นหา ===")
+        total_found = len(valid_docs) if isinstance(valid_docs, list) else 0
+        print(f"เอกสารที่พบทั้งหมด : {total_found} เอกสาร")
+        if total_found > 0:
+            print("✔ พบข้อมูลที่เกี่ยวข้อง สามารถใช้ RAG ได้")
+        else:
+            print("ไม่พบข้อมูลที่เกี่ยวข้อง -> ใช้ความรู้ทั่วไป (No-RAG)")
+        print("==== เสร็จสิ้นการค้นหา ===\n")
+
+        # แสดงข้อมูลที่ใช้จากฐานข้อมูล
+        if total_found > 0:
+            print(f"🗄️ ใช้ข้อมูลจากฐานข้อมูล: {total_found} เอกสาร")
+            print("💬 กำลังส่งคำถามไปยัง GPT...")
+        
+        # GPT Response (แสดงแค่ความยาว ไม่แสดงคำตอบ)
+        ans_len = len(answer) if isinstance(answer, str) else 0
+        if ans_len > 0:
+            print(f"✔ ได้รับค่าตอบจาก GPT (ความยาว: {ans_len} ตัวอักษร)\n")
+
+        # สรุปแหล่งที่มาของข้อมูล
+        if total_found:
+            print("=== สรุปแหล่งที่มาของข้อมูล ===")
+            for i, doc in enumerate(valid_docs, 1):
+                try:
+                    if isinstance(doc, dict):
+                        source = doc.get("source", "Unknown source")
+                        sim = doc.get("similarity")
+                        
+                        # กำหนด emoji ตามประเภทของเอกสาร
+                        collection = doc.get("collection", "")
+                        if "image" in collection:
+                            emoji = "🖼️"
+                        else:
+                            emoji = "📄"
+                        
+                        if sim is not None:
+                            print(f"{emoji} เอกสารที่ {i}: {source} (Similarity: {sim:.4f})")
+                        else:
+                            print(f"{emoji} เอกสารที่ {i}: {source}")
+                    else:
+                        print(f"📄 เอกสารที่ {i}: ข้อมูลทั่วไป")
+                except Exception:
+                    print(f"❓ เอกสารที่ {i}: ไม่สามารถแสดงรายละเอียดได้")
+            print("=== เสร็จสิ้นการสรุปแหล่งที่มา ===\n")
+
+    except Exception:
+        # อย่าทำให้ flow ล้ม หากมีปัญหาในการพิมพ์ report
+        pass
+
 
 
 # ✔️ บันทึกคำตอบที่ใช้ตอบผู้ใช้ใน collection responses (ไม่เก็บคำถาม)
@@ -110,54 +197,8 @@ def store_user_question(
     user_id: str = "unknown",
     context_data: dict = None
 ):
-    """
-    บันทึกคำถามของผู้ใช้ใน user_profiles collection
-    
-    Args:
-        question (str): คำถามของผู้ใช้
-        user_id (str): ID ของผู้ใช้
-        context_data (dict): ข้อมูลบริบทเพิ่มเติม
-    """
-    try:
-        mongo_uri = os.getenv("MONGO_URL")
-        if not mongo_uri or mongo_uri == "mongodb+srv://your-username:your-password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority":
-            logger.warning("MONGO_URL not configured properly, skipping question storage")
-            return
-        
-        logger.info(f"🔄 Attempting to store question for user {user_id}")
-        
-        mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
-        profiles_collection = mongo_client["astrobot"]["user_profiles"]
-        
-        # สร้างข้อมูลสำหรับบันทึกคำถาม
-        question_data = {
-            "user_id": user_id,
-            "question": question,
-            "question_timestamp": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
-        }
-        
-        # เพิ่มข้อมูลบริบทถ้ามี
-        if context_data:
-            question_data.update(context_data)
-        
-        # อัปเดตหรือสร้างโปรไฟล์ใหม่
-        result = profiles_collection.update_one(
-            {"user_id": user_id},
-            {"$set": question_data},
-            upsert=True
-        )
-        
-        logger.info(f"✅ Successfully stored question in user_profiles for user {user_id}")
-        logger.info(f"📊 Question data: user_id={user_id}, question_length={len(question)}")
-        
-        mongo_client.close()
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to store question in user_profiles: {e}")
-        logger.error(f"📝 Error details - user_id: {user_id}")
-        import traceback
-        logger.error(f"🔍 Full traceback: {traceback.format_exc()}")
+    # ปิดการบันทึกคำถามลง MongoDB (no-op) เพื่อไม่เก็บ user_profiles ใดๆ
+    return
 
 # ✔️ บันทึกหรืออัปเดต user_profiles พร้อมบริบทการสนทนา
 def log_user_interaction(
@@ -167,50 +208,8 @@ def log_user_interaction(
     user_id: str = "unknown",
     context_data: dict = None
 ):
-    # print(f"\n=== บันทึกการโต้ตอบลง MongoDB ===")
-    # print(f"User ID: {user_id}")
-    # print(f"คำถาม: {question}")
-    # print(f"คำตอบ: {answer[:100]}...")
-    # print(f"Embedding size: {len(embedding)}")
-    
-    mongo_uri = os.getenv("MONGO_URL")
-    if not mongo_uri or mongo_uri == "mongodb+srv://your-username:your-password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority":
-        # print("MONGO_URL not configured properly. Please set up your .env file with valid MongoDB connection string.")
-        return
-    mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
-    collection = mongo_client[SUMMARY_DB_NAME]["user_profiles"]
-
-    existing_profile = collection.find_one({"user_id": user_id})
-    # print(f"พบโปรไฟล์เดิม: {existing_profile is not None}")
-
-    update_data = {
-        "question": question,
-        "embedding": embedding,
-        "response": answer,
-        "updated_at": datetime.utcnow()
-    }
-
-    if not existing_profile:
-        update_data["created_at"] = datetime.utcnow()
-        # print("สร้างโปรไฟล์ใหม่")
-
-    # บันทึกข้อมูลบริบท
-    if context_data:
-        update_data.update(context_data)
-        # print(f"บันทึกข้อมูลบริบท: {context_data}")
-
-    if existing_profile and "birth_date" in existing_profile:
-        update_data["birth_date"] = existing_profile["birth_date"]
-        # print(f"ข้อมูลวันเกิด: {existing_profile['birth_date']}")
-
-    result = collection.update_one(
-        {"user_id": user_id},
-        {"$set": update_data},
-        upsert=True
-    )
-
-    # print(f"บันทึก user_profiles สำหรับ {user_id} แล้ว (Matched: {result.matched_count}, Modified: {result.modified_count})")
-    # print(f"=== เสร็จสิ้นการบันทึก ===\n")
+    # ปิดการบันทึก/อัปเดตโปรไฟล์ (no-op)
+    return
 
 # ดึงข้อมูลวันเกิดของผู้ใช้
 def get_user_birth_date(user_id: str):
@@ -403,97 +402,20 @@ def get_user_conversation_history(user_id: str, limit: int = 10):
         logger.error(f"ไม่สามารถดึงประวัติการสนทนาได้: {e}")
         return []
 
-# ตรวจสอบและอัปเดตจำนวนคำถามต่อเนื่อง
-def check_and_update_question_limit(user_id: str, max_questions: int = 3):
+# ตรวจสอบและอัปเดตจำนวนคำถามต่อวัน
+def check_and_update_question_limit(user_id: str, max_questions: int = 999999):
     """
-    ตรวจสอบและอัปเดตจำนวนคำถามต่อเนื่องของผู้ใช้
+    ตรวจสอบและอัปเดตจำนวนคำถามต่อวันของผู้ใช้ (ไม่จำกัดจำนวนครั้ง)
     
     Args:
         user_id (str): ID ของผู้ใช้
-        max_questions (int): จำนวนคำถามสูงสุดที่อนุญาต (ค่าเริ่มต้น: 3)
+        max_questions (int): จำนวนคำถามสูงสุดที่อนุญาตต่อวัน (ค่าเริ่มต้น: 999999 - ไม่จำกัด)
         
     Returns:
         tuple: (is_allowed, current_count, message)
     """
-    try:
-        mongo_uri = os.getenv("MONGO_URL")
-        if not mongo_uri or mongo_uri == "mongodb+srv://your-username:your-password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority":
-            logger.warning("MONGO_URL not configured properly, allowing question")
-            return True, 0, ""
-            
-        mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
-        collection = mongo_client[SUMMARY_DB_NAME]["user_profiles"]
-        
-        user_profile = collection.find_one({"user_id": user_id})
-        current_date = datetime.utcnow().date()
-        
-        if not user_profile:
-            # ผู้ใช้ใหม่ - อนุญาตให้ถามได้
-            update_data = {
-                "user_id": user_id,
-                "daily_question_count": 1,
-                "last_question_date": current_date.isoformat(),
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow()
-            }
-            collection.update_one(
-                {"user_id": user_id},
-                {"$set": update_data},
-                upsert=True
-            )
-            logger.info(f"✅ New user {user_id} - Question 1/3 allowed")
-            return True, 1, ""
-        
-        # ตรวจสอบวันที่ของคำถามล่าสุด
-        last_question_date = user_profile.get("last_question_date")
-        daily_question_count = user_profile.get("daily_question_count", 0)
-        
-        if last_question_date:
-            # แปลงเป็น date object ถ้าเป็น string
-            if isinstance(last_question_date, str):
-                last_question_date = datetime.fromisoformat(last_question_date).date()
-            elif hasattr(last_question_date, 'date'):
-                last_question_date = last_question_date.date()
-        
-        # รีเซ็ตจำนวนคำถามถ้าเป็นวันใหม่
-        if not last_question_date or last_question_date < current_date:
-            daily_question_count = 0
-            logger.info(f"🔄 Reset question count for user {user_id} - new day")
-        
-        # ตรวจสอบจำนวนคำถาม
-        if daily_question_count >= max_questions:
-            remaining_hours = 24 - (datetime.utcnow().hour)
-            message = f"""ขออภัยครับ คุณได้ถามคำถามครบ {max_questions} คำถามแล้วในวันนี้
-
-คุณสามารถถามคำถามใหม่ได้ในวันพรุ่งนี้ หรือรออีก {remaining_hours} ชั่วโมง
-
-ขอบคุณที่ใช้บริการโหราศาสตร์ครับ! 🌟"""
-            
-            logger.info(f"🚫 User {user_id} exceeded question limit: {daily_question_count}/{max_questions}")
-            return False, daily_question_count, message
-        
-        # อัปเดตจำนวนคำถาม
-        new_count = daily_question_count + 1
-        update_data = {
-            "daily_question_count": new_count,
-            "last_question_date": current_date.isoformat(),
-            "updated_at": datetime.utcnow()
-        }
-        
-        collection.update_one(
-            {"user_id": user_id},
-            {"$set": update_data}
-        )
-        
-        remaining_questions = max_questions - new_count
-        logger.info(f"✅ User {user_id} - Question {new_count}/{max_questions} allowed (remaining: {remaining_questions})")
-        
-        return True, new_count, ""
-        
-    except Exception as e:
-        logger.error(f"❌ Error checking question limit for user {user_id}: {e}")
-        # ในกรณีที่เกิดข้อผิดพลาด ให้อนุญาตให้ถามได้
-        return True, 0, ""
+    # ปิดระบบนับ/อัปเดตจำนวนคำถาม (no-op) และอนุญาตเสมอ โดยไม่เขียน DB
+    return True, 0, ""
 
 # ฟังก์ชันวิเคราะห์เจตนาของคำถาม
 def analyze_question_intent(question: str) -> dict:
@@ -555,6 +477,14 @@ def analyze_question_intent(question: str) -> dict:
     if any(keyword in question_lower for keyword in color_keywords):
         intent["is_lucky_colors"] = True
         intent["specific_topic"] = "lucky_colors"
+    
+    # ตรวจสอบคำถามทั่วไปเกี่ยวกับดวงชะตา
+    general_horoscope_keywords = ["ทำนายดวง", "ดูดวง", "ดวงชะตา", "ดวงกำเนิด", "ทำนายดวงกำเนิด", "ดูดวงกำเนิด", "ราศีอะไร"]
+    if any(keyword in question_lower for keyword in general_horoscope_keywords):
+        # ถ้ายังไม่ได้กำหนด specific_topic ให้ถือว่าเป็นคำถามทั่วไป
+        if not intent["specific_topic"]:
+            intent["is_general"] = True
+            intent["specific_topic"] = "general"
     
     # ตรวจสอบคำถามทั่วไปที่ใช้คำว่า "เป็นยังไง", "เป็นอย่างไร", "ยังไง", "อย่างไร", "เป็นไง"
     general_keywords = ["เป็นยังไง", "เป็นอย่างไร", "ยังไง", "อย่างไร", "เป็นไง"]
@@ -715,8 +645,8 @@ def enhance_question_context(question: str, user_context: dict = None) -> str:
             # print(f"แปลงคำถาม: {question} → {enhanced}")
             return enhanced
         else:
-            # แจ้งเตือนผู้ใช้เมื่อไม่มีข้อมูลราศี
-            return "ขออภัยค่ะ ระบบไม่พบข้อมูลราศีของคุณ กรุณาระบุวันเกิดก่อน เช่น '09/02/2004 ราศีอะไร' หรือ 'ฉันเกิดวันที่ 9 กุมภาพันธ์ 2004'"
+            # ไม่มีข้อมูลราศี ก็ส่งคำถามเดิมกลับไปเพื่อให้ระบบตอบแบบทั่วไป
+            return question
     
     return question
 
@@ -889,16 +819,6 @@ def check_follow_up_question_with_llm(question: str, user_context: dict = None) 
         # ใช้ LLM เพื่อตรวจสอบความเกี่ยวข้อง
         from openai import OpenAI
         openai_key = os.getenv("OPENAI_API_KEY")
-        if not openai_key or openai_key == "your-openai-api-key-here":
-            # Fallback to simple keyword check
-            return any(word in question.lower() for word in [
-                "ราศีนี้", "ราศีของฉัน", "ราศีของผม", "ราศีของเรา", "คนราศีนี้", 
-                "นิสัย", "ลักษณะ", "สัย", "เป็นไง", "เป็นอย่างไร", "ยังไง", "อย่างไร",
-                "ความรัก", "อาชีพ", "การงาน", "สุขภาพ", "การเงิน", "สีมงคล", "เหมาะ", "ดี", "เป็น",
-                "เป็นคน", "คน", "ดวง", "โหราศาสตร์", "ดาวเคราะห์", "บ้าน", "แอสเปค",
-                "ของคน", "ของ", "เป็นยังไง", "เป็นอย่างไร", "ยังไง", "อย่างไร", "เป็นไง"
-            ])
-        
         client = OpenAI(api_key=openai_key)
         
         # สร้าง prompt สำหรับตรวจสอบความเกี่ยวข้อง
@@ -921,8 +841,10 @@ def check_follow_up_question_with_llm(question: str, user_context: dict = None) 
 
 ตอบแค่ "YES" หรือ "NO" เท่านั้น:"""
         
+        # ใช้ชื่อโมเดลจาก ENV ถ้าไม่ระบุจะใช้ gpt-4o-mini
+        openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=openai_model,
             messages=[
                 {"role": "system", "content": "คุณเป็นผู้เชี่ยวชาญในการวิเคราะห์ความเกี่ยวข้องของคำถาม ตอบแค่ YES หรือ NO เท่านั้น"},
                 {"role": "user", "content": prompt}
@@ -940,20 +862,15 @@ def check_follow_up_question_with_llm(question: str, user_context: dict = None) 
         
     except Exception as e:
         logger.warning(f"Error in LLM follow-up check: {e}")
-        # Fallback to simple keyword check
-        return any(word in question.lower() for word in [
-            "ราศีนี้", "ราศีของฉัน", "ราศีของผม", "ราศีของเรา", "คนราศีนี้", 
-            "นิสัย", "ลักษณะ", "สัย", "เป็นไง", "เป็นอย่างไร", "ยังไง", "อย่างไร",
-            "ความรัก", "อาชีพ", "การงาน", "สุขภาพ", "การเงิน", "สีมงคล", "เหมาะ", "ดี", "เป็น",
-            "เป็นคน", "คน", "ดวง", "โหราศาสตร์", "ดาวเคราะห์", "บ้าน", "แอสเปค",
-            "ของคน", "ของ", "เป็นยังไง", "เป็นอย่างไร", "ยังไง", "อย่างไร", "เป็นไง"
-        ])
+        # ถ้าเกิด error ให้ return False (ไม่ใช่ follow-up)
+        # เพื่อให้ระบบยังทำงานต่อได้ แม้ว่าจะไม่สามารถตรวจสอบ follow-up ได้
+        return False
 
-def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
+def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_info: dict = None) -> str:
     # print(f"\n=== เริ่มการค้นหาข้อมูลสำหรับคำถาม: {question} ===")
     
-    # ตรวจสอบจำนวนคำถามต่อเนื่องก่อน
-    is_allowed, current_count, limit_message = check_and_update_question_limit(user_id, max_questions=3)
+    # ตรวจสอบจำนวนคำถามต่อเนื่องก่อน (ไม่จำกัดจำนวนครั้ง)
+    is_allowed, current_count, limit_message = check_and_update_question_limit(user_id)
     if not is_allowed:
         logger.info(f"🚫 Question limit exceeded for user {user_id}: {current_count}/3")
         return limit_message
@@ -971,31 +888,26 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
     birth_info_from_question = extract_birth_info_from_message(question)
     astrology_chart = None
     
-    # ตรวจสอบและแจ้งเตือนเมื่อไม่มีบริบทสำหรับคำถามต่อเนื่อง
-    if is_follow_up_question and not user_context:
-        return """ขออภัยค่ะ ระบบไม่พบข้อมูลบริบทการสนทนาของคุณ
-
-กรุณาระบุวันเกิดก่อน เช่น:
-- 09/02/2004 ราศีอะไร
-- ฉันเกิดวันที่ 9 กุมภาพันธ์ 2004
-- ดูดวงวันเกิด 09/02/2004
-
-หลังจากนั้นคุณสามารถถามคำถามต่อเนื่องได้ เช่น 'แล้วราศีนี้มีลักษณะนิสัยยังไง'"""
+    # ถ้ามี chart_info ที่ส่งมา ให้ใช้เลย (กรณีเรียกจาก generate_birth_chart_prediction)
+    if provided_chart_info:
+        astrology_chart = provided_chart_info
+        is_follow_up_question = False  # ถ้ามี chart_info ที่ส่งมา ให้ถือว่าไม่ใช่คำถามต่อเนื่อง
+        logger.info(f"ใช้ chart_info ที่ส่งมา: ราศี{astrology_chart.get('zodiac_sign', 'Unknown')}")
+    
+    # เดิม: หากเป็นคำถามต่อเนื่องแต่ไม่มีบริบทจะคืนข้อความแจ้งเตือน
+    # ใหม่: ตอบแบบทั่วไปไปก่อน (ไม่บังคับให้ระบุวันเกิด)
+    if is_follow_up_question and not user_context and not (birth_info_from_question and birth_info_from_question.get('date')):
+        is_follow_up_question = False
     
     # ถ้ามีข้อมูลวันเกิดในคำถาม ให้ถือว่าไม่ใช่คำถามต่อเนื่อง
     if birth_info_from_question and birth_info_from_question.get('date'):
         is_follow_up_question = False
         logger.info(f"ไม่ใช่คำถามต่อเนื่อง เพราะมีข้อมูลวันเกิดในคำถาม: {birth_info_from_question['date']}")
     
-    # ตรวจสอบว่ามีข้อมูลวันเกิดในคำถามหรือไม่ ถ้ามีให้ข้ามการตรวจสอบนี้
+    # เดิม: ถ้าเป็น follow-up แต่ไม่มีราศีในบริบทจะคืนข้อความแจ้งเตือน
+    # ใหม่: ปลดสถานะเป็นคำถามทั่วไป แล้วดำเนินการตอบตามปกติ
     if is_follow_up_question and user_context and not user_zodiac and not birth_info_from_question:
-        return """ขออภัยค่ะ ระบบไม่พบข้อมูลราศีของคุณ
-
-กรุณาระบุวันเกิดก่อน เช่น:
-- 09/02/2004 ราศีอะไร
-- ฉันเกิดวันที่ 9 กุมภาพันธ์ 2004
-
-หลังจากนั้นคุณสามารถถามคำถามต่อเนื่องได้"""
+        is_follow_up_question = False
     
     # Debug: แสดงข้อมูลการตัดสินใจ (ปิดการแสดงผล)
     # print(f"DEBUG - คำถาม: {question}")
@@ -1004,8 +916,8 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
     # print(f"DEBUG - user_zodiac: {user_zodiac}")
     # print(f"DEBUG - birth_info_from_question: {birth_info_from_question}")
     
-    # สร้างข้อมูลดวงชะตาเมื่อมีข้อมูลวันเกิดในคำถาม
-    if birth_info_from_question and birth_info_from_question['date']:
+    # สร้างข้อมูลดวงชะตาเมื่อมีข้อมูลวันเกิดในคำถาม (ถ้ายังไม่มี chart_info อยู่แล้ว)
+    if not astrology_chart and birth_info_from_question and birth_info_from_question['date']:
         logger.info(f"พบข้อมูลวันเกิดในคำถาม: {birth_info_from_question['date']}")
         if birth_info_from_question['time']:
             logger.info(f"พบเวลาเกิดในคำถาม: {birth_info_from_question['time']}")
@@ -1014,7 +926,7 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
         astrology_chart = generate_detailed_astrology_reading(question)
         if astrology_chart:
             logger.info(f"สร้างดวงชะตาสำเร็จ: ราศี{astrology_chart['zodiac_sign']} ({astrology_chart['zodiac_element']})")
-    elif user_context and user_zodiac and is_follow_up_question:
+    elif not astrology_chart and user_context and user_zodiac and is_follow_up_question:
         # สำหรับคำถามต่อเนื่อง ให้ใช้ข้อมูลจากบริบท
         # print(f"DEBUG - ใช้ข้อมูลดวงชะตาจากบริบท: ราศี{user_zodiac}")
         # สร้างข้อมูลดวงชะตาจากบริบท
@@ -1037,14 +949,9 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
         # print(f"DEBUG - astrology_chart: {astrology_chart}")
     
     # ตรวจสอบว่ามีข้อมูลดวงชะตาหรือไม่ ถ้าไม่มีให้ตอบข้อความแจ้งเตือน
-    if not astrology_chart:
-        return """ขออภัยค่ะ ระบบไม่พบข้อมูลราศีของคุณ
-
-กรุณาระบุวันเกิดก่อน เช่น:
-- 09/02/2004 ราศีอะไร
-- ฉันเกิดวันที่ 9 กุมภาพันธ์ 2004
-
-หลังจากนั้นคุณสามารถถามคำถามต่อเนื่องได้"""
+    if not astrology_chart or not astrology_chart.get('zodiac_sign'):
+        # ไม่มีดวงชะตาเพียงพอ ก็ยังตอบแบบทั่วไปได้
+        pass
     
     # สร้างข้อมูลบริบทสำหรับการสนทนา
     context_info = ""
@@ -1087,8 +994,13 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
         query_embedding = model.encode(question)
         # print(f"สร้าง query embedding สำเร็จ (ขนาด: {len(query_embedding)})")
         
-        # ค้นหาจาก collections ทั้งหมดที่มีข้อมูลใน SUMMARY_DB_NAME (ใช้ summary embeddings)
-        collections_to_search = ["text_chunks", "image_chunks", "table_chunks"]
+        # ค้นหาจาก collections ที่บันทึกข้อมูลสรุปแล้วใน SUMMARY_DB_NAME (ใช้ summary embeddings)
+        # ต้องตรงกับชื่อ collection ที่ pipeline multimodel_rag สร้างไว้
+        collections_to_search = [
+            "processed_text_chunks",
+            "processed_image_chunks",
+            "processed_table_chunks",
+        ]
         
         for collection_name in collections_to_search:
             try:
@@ -1130,36 +1042,39 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
                         pass
                     
                     for i, (similarity, doc) in enumerate(top_docs):
+                        # เพิ่มข้อมูล source
+                        source_info = f"[{collection_name}]"
+                        if 'page' in doc:
+                            source_info += f" หน้า {doc['page']}"
+                        if 'chunk_id' in doc:
+                            source_info += f" Chunk {doc['chunk_id']}"
+                        if 'type' in doc:
+                            source_info += f" ({doc['type']})"
+                        
+                        # ใช้ข้อมูลจาก summary database เท่านั้น
+                        summary_content = get_summary_content(doc.get('_id'), collection_name)
+                        
+                        doc_info = {
+                            'text': doc['text'],
+                            'summary': doc.get('summary', ''),
+                            'summary_content': summary_content,
+                            'source': source_info,
+                            'similarity': similarity,
+                            'collection': collection_name,
+                            'doc_id': doc.get('_id')
+                        }
+                        
+                        # เพิ่มเอกสารทั้งหมด แต่ mark ว่าต่ำกว่า threshold หรือไม่
                         if similarity > 0.2:  # ลด threshold จาก 0.3 เป็น 0.2
                             # print(f"\nเอกสารที่ {i+1} จาก {collection_name} (Similarity: {similarity:.4f}):")
                             # print(f"   เนื้อหา: {doc['text'][:200]}...")
-                            
-                            # เพิ่มข้อมูล source
-                            source_info = f"[{collection_name}]"
-                            if 'page' in doc:
-                                source_info += f" หน้า {doc['page']}"
-                            if 'chunk_id' in doc:
-                                source_info += f" Chunk {doc['chunk_id']}"
-                            if 'type' in doc:
-                                source_info += f" ({doc['type']})"
-                            
                             # print(f"   แหล่งที่มา: {source_info}")
-                            
-                            # ใช้ข้อมูลจาก summary database เท่านั้น
-                            summary_content = get_summary_content(doc.get('_id'), collection_name)
-                            
-                            retrieved_docs.append({
-                                'text': doc['text'],
-                                'summary': doc.get('summary', ''),
-                                'summary_content': summary_content,
-                                'source': source_info,
-                                'similarity': similarity,
-                                'collection': collection_name,
-                                'doc_id': doc.get('_id')
-                            })
+                            retrieved_docs.append(doc_info)
                         else:
                             # print(f"เอกสารที่ {i+1} มี similarity ต่ำเกินไป: {similarity:.4f}")
-                            pass
+                            # เพิ่มเอกสารที่ต่ำกว่า threshold เพื่อแสดงใน terminal
+                            doc_info['below_threshold'] = True
+                            retrieved_docs.append(doc_info)
                 
                 client.close()
                     
@@ -1172,25 +1087,20 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
         # print("ใช้ GPT โดยตรงแทน")
         pass
     
-    # แสดงสรุปผลการค้นหา
-    # print(f"\n=== สรุปผลการค้นหา ===")
-    # print(f"เอกสารที่พบทั้งหมด: {len(retrieved_docs)} เอกสาร")
-    # if retrieved_docs:
-    #     print(f"พบข้อมูลที่เกี่ยวข้อง สามารถใช้ RAG ได้")
-    # else:
-    #     print(f"ไม่พบข้อมูลที่เกี่ยวข้อง ใช้ความรู้ทั่วไป")
-    # print(f"=== เสร็จสิ้นการค้นหา ===\n")
+    # หมายเหตุ: รายงานสรุปจะพิมพ์หลังจากได้คำตอบแล้ว เพื่อรวมความยาวคำตอบด้วย
     
     # ใช้ direct GPT เพราะ vector store ไม่มีข้อมูล
     query_vector = []
+    # กำหนดธงสำหรับสร้างคำถามต่อเนื่องอัตโนมัติเมื่อมีข้อมูลวันเกิดในคำถาม
+    should_create_chart = bool(birth_info_from_question and birth_info_from_question.get('date'))
 
     # ใช้ GPT โดยตรง (ไม่ใช้ RAG เพราะ vector store ไม่มีข้อมูล)
     try:
         from openai import OpenAI
         openai_key = os.getenv("OPENAI_API_KEY")
         if not openai_key or openai_key == "your-openai-api-key-here":
-            # print("OPENAI_API_KEY not configured properly. Please set up your .env file with valid OpenAI API key.")
-            return "ขออภัยค่ะ ระบบยังไม่ได้ตั้งค่า API key สำหรับ OpenAI กรุณาติดต่อผู้ดูแลระบบ"
+            # ถ้าไม่ตั้งค่า API key ให้ตอบแบบ fallback ทั่วไปแทนการเรียก LLM
+            return "ขออภัยค่ะ ตอนนี้ระบบยังไม่พร้อมใช้งาน AI ภายนอก แต่คุณสามารถถามเกี่ยวกับราศีได้ตามปกติ เช่น 'นิสัยราศีเมถุนเป็นยังไง' หรือ 'สีมงคลราศีสิงห์'"
         client = OpenAI(api_key=openai_key)
         
         # สร้าง context จากเอกสารที่ค้นหาได้จาก astrobot_summary เท่านั้น
@@ -1242,7 +1152,6 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
 **ข้อมูลเพิ่มเติม:**
 - ราศี{astrology_chart['zodiac_sign']} เป็นราศีสุดท้ายของจักรราศี
 - ราศี{astrology_chart['zodiac_sign']} มีธาตุ{astrology_chart['zodiac_element']}
-- ราศี{astrology_chart['zodiac_sign']} มีคุณภาพ Mutable
 
 **คำสั่งสำคัญ:**
 - ต้องใช้คำว่า "ลัคณา" แทน "Ascendant" ในทุกกรณี
@@ -1275,12 +1184,15 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
 หมายเหตุ: ลัคณาเป็นราศีประจำลัคนาที่แสดงบุคลิกภาพภายนอกและวิธีการที่ผู้อื่นมองเห็นคุณ
 """
 
-            # เพิ่มข้อมูลรายละเอียดการงาน การเงิน ความรัก
+            # เพิ่มข้อมูลรายละเอียดลักษณะนิสัย การงาน การเงิน ความรัก (เฉพาะ 4 ด้าน)
             if 'detailed_reading' in astrology_chart:
                 detailed = astrology_chart['detailed_reading']
                 chart_info += f"""
 
 **การทำนายรายละเอียดสำหรับราศี{astrology_chart['zodiac_sign']}:**
+
+ลักษณะนิสัยและบุคลิกภาพ:
+{detailed.get('ลักษณะนิสัย', detailed.get('personality_traits', 'ไม่มีข้อมูลลักษณะนิสัย'))}
 
 ด้านการงาน:
 {detailed.get('การงาน', 'ไม่มีข้อมูลการงาน')}
@@ -1298,34 +1210,6 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
 """
                 else:
                     chart_info += f"{detailed.get('ความรัก', 'ไม่มีข้อมูลความรัก')}"
-
-                chart_info += f"""
-
-ด้านสุขภาพ:
-{detailed.get('สุขภาพ', 'ไม่มีข้อมูลสุขภาพ')}
-
-สีมงคล:
-{detailed.get('สีมงคล', 'ไม่มีข้อมูลสีมงคล')}
-"""
-
-            # เพิ่มข้อมูลสีมงคล
-            if 'lucky_colors' in astrology_chart and astrology_chart['lucky_colors']:
-                chart_info += f"""
-
-สีมงคล:
-สีดี: {', '.join(astrology_chart['lucky_colors'])}
-สีไม่ดี: {', '.join(astrology_chart['bad_colors']) if astrology_chart['bad_colors'] else 'ไม่มีข้อมูล'}
-"""
-
-            # เพิ่มข้อมูลโชคลาภ
-            if 'omen_info' in astrology_chart:
-                omen = astrology_chart['omen_info']
-                chart_info += f"""
-
-**โชคลาภและวาสนา:**
-ชื่อ: {omen.get('ชื่อ', 'ไม่มีข้อมูล')}
-ความหมาย: {omen.get('ความหมาย', 'ไม่มีข้อมูล')}
-"""
 
 
         # สร้าง prompt สำหรับแชทบอทโหราศาสตร์ตะวันตก
@@ -1375,9 +1259,13 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
 """
         else:
             focus_instruction = """
-**คำสั่งสำคัญ: ตอบครบทุกด้านตามปกติ**
-- ให้ข้อมูลครบถ้วนในด้านต่างๆ (ลักษณะนิสัย, ความรัก, การงาน, การเงิน, สุขภาพ, สีมงคล)
-- เริ่มต้นด้วยการระบุวันเกิดและราศีอาทิตย์อย่างชัดเจน
+**คำสั่งสำคัญ: สำหรับคำถามเกี่ยวกับดวงชะตาโดยรวม ต้องตอบครบทั้ง 4 ด้านเสมอ**
+- **ด้านการงาน:** ให้ข้อมูลเกี่ยวกับอาชีพที่เหมาะ การทำงาน ความสำเร็จในหน้าที่การงาน และทักษะที่โดดเด่น
+- **ด้านการเงิน:** ให้ข้อมูลเกี่ยวกับการจัดการเงิน การลงทุน การออม และการสร้างความมั่งคั่ง
+- **ด้านความรัก:** ให้ข้อมูลเกี่ยวกับความสัมพันธ์ การเข้ากันได้กับคนอื่น สำหรับคนโสดและคนมีคู่
+- เริ่มต้นด้วยการระบุวันเกิดและราศีเกิดอย่างชัดเจน
+- ห้ามตอบเรื่องสุขภาพหรือสีมงคล
+- ต้องตอบครบทั้ง 4 ด้านเพื่อให้คำทำนายที่สมบูรณ์
 """
 
         # สร้าง astrology_prompt ที่เหมาะสม
@@ -1385,7 +1273,7 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
             astrology_prompt = f"""คุณเป็นโหราจารย์ดิจิทัลผู้เชี่ยวชาญด้านโหราศาสตร์ตะวันตก (Western Astrology) ที่มีความรู้ลึกซึ้งเกี่ยวกับดาวเคราะห์ ราศี และการตีความดวงกำเนิด
 
 **บทบาทและความเชี่ยวชาญ:**
-- คุณมีความเข้าใจในพลังของราศีอาทิตย์ (Sun Sign) และลัคณา (ราศีประจำลัคนา)
+- คุณมีความเข้าใจในพลังของราศีเกิด และลัคณา (ราศีประจำลัคนา)
 - คุณสามารถผสานข้อมูลจากฐานความรู้เพื่อสร้างคำทำนายที่เฉพาะตัว
 - คุณให้คำแนะนำที่อบอุ่น เป็นมิตร และให้กำลังใจ
 - คุณสามารถรักษาบริบทการสนทนาและตอบคำถามต่อเนื่องได้อย่างเป็นธรรมชาติ
@@ -1410,15 +1298,17 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
 **คำถามของผู้ใช้:** {question}
 
 **วิธีการตอบคำถาม:**
-1. **สำหรับคำถามใหม่:** เริ่มต้นด้วยการระบุวันเกิดและราศีอาทิตย์อย่างชัดเจน
-2. **สำหรับคำถามต่อเนื่อง:** ใช้ข้อมูลราศีที่มีอยู่แล้วและตอบคำถามเฉพาะเจาะจง
-3. อธิบายลักษณะนิสัยตามราศีและธาตุ โดยอ้างอิงจากข้อมูลในฐานความรู้
-4. **หากมีข้อมูล Ascendant:** ใช้ข้อมูล Ascendant เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ
-5. ใช้ภาษาที่เป็นธรรมชาติ อ่อนโยน และเข้าใจง่าย
-6. หลีกเลี่ยงคำทำนายเชิงโชคชะตาเด็ดขาด ใช้คำว่า "มีแนวโน้ม", "สะท้อนว่า", "บ่งบอกถึงพลังของ..."
-7. ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
-8. ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ
-9. **สำหรับคำถามต่อเนื่อง:** อย่าเปลี่ยนราศีหรือข้อมูลวันเกิด ให้ใช้ข้อมูลเดิมที่ผู้ใช้ให้มา
+1. **สำหรับคำถามใหม่:** เริ่มต้นด้วยการระบุวันเกิดและราศีเกิดอย่างชัดเจน
+2. **สำหรับคำถามทั่วไปเกี่ยวกับดวงชะตา:** ต้องตอบครบทั้ง 4 ด้าน (ลักษณะนิสัยและบุคลิกภาพ, การงาน, การเงิน, ความรัก) เพื่อให้คำทำนายที่สมบูรณ์
+3. **สำหรับคำถามเฉพาะด้าน:** ตอบเฉพาะด้านที่ถามเท่านั้น (ถ้าถามเกี่ยวกับการงาน ก็ตอบเฉพาะการงาน เท่านั้น)
+4. **สำหรับคำถามต่อเนื่อง:** ใช้ข้อมูลราศีที่มีอยู่แล้วและตอบคำถามเฉพาะเจาะจง
+5. อธิบายลักษณะนิสัยตามราศีและธาตุ โดยอ้างอิงจากข้อมูลในฐานความรู้
+6. **หากมีข้อมูล Ascendant:** ใช้ข้อมูล Ascendant เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ
+7. ใช้ภาษาที่เป็นธรรมชาติ อ่อนโยน และเข้าใจง่าย
+8. หลีกเลี่ยงคำทำนายเชิงโชคชะตาเด็ดขาด ใช้คำว่า "มีแนวโน้ม", "สะท้อนว่า", "บ่งบอกถึงพลังของ..."
+9. ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
+10. ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ
+11. **สำหรับคำถามต่อเนื่อง:** อย่าเปลี่ยนราศีหรือข้อมูลวันเกิด ให้ใช้ข้อมูลเดิมที่ผู้ใช้ให้มา
 
 **การจัดการคำถามต่อเนื่อง:**
 - ถ้าผู้ใช้ถามเกี่ยวกับ "ราศีนี้", "นิสัย", "ลักษณะ", "คนราศีนี้" โดยไม่ระบุราศี ให้ใช้ราศีจากข้อมูลบริบท
@@ -1438,18 +1328,21 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
 - **คำลงท้ายต้องใช้ "ค่ะ" เท่านั้น ห้ามใช้ "ครับ/ค่ะ" หรือ "ครับ"**
 
 **การจัดการข้อมูลที่ไม่ครบ:**
-- หากไม่มีข้อมูลวันเกิดหรือราศี ให้แจ้งเตือนผู้ใช้ให้ระบุข้อมูลก่อน
-- ใช้ข้อความ: "ขออภัยค่ะ ระบบไม่พบข้อมูลราศีของคุณ กรุณาระบุวันเกิดก่อน เช่น '09/02/2004 ราศีอะไร'"
+- **หากไม่มีข้อมูลวันเกิดหรือราศีในคำถาม:**
+  - ห้ามสร้างข้อมูลราศีหรือวันเกิดใหม่
+  - ห้ามแจ้งเตือนผู้ใช้ในเนื้อหาของคำตอบ
+  - ให้ส่งคำตอบแบบปกติโดยใช้ข้อมูลที่มีอยู่เท่านั้น
 - หากมีข้อมูลบางส่วนไม่ครบ ให้ใช้ความรู้โหราศาสตร์ทั่วไปในการให้คำแนะนำ
-- ห้ามใช้ข้อความเช่น "ไม่มีข้อมูลเพิ่มเติม", "ไม่สามารถให้คำแนะนำเฉพาะได้", "ข้อมูลไม่เพียงพอ" เว้นแต่จะไม่มีข้อมูลวันเกิดหรือราศีเลย
-- **หากมีข้อมูลดวงชะตาแล้ว ให้ใช้ข้อมูลนั้นในการตอบคำถาม ไม่ต้องแจ้งเตือนว่าไม่พบข้อมูล**
+- ห้ามใช้ข้อความเช่น "ไม่มีข้อมูลเพิ่มเติม", "ไม่สามารถให้คำแนะนำเฉพาะได้", "ข้อมูลไม่เพียงพอ" ในคำตอบ
+- **หากมีข้อมูลดวงชะตาแล้ว ให้ใช้ข้อมูลนั้นในการตอบคำถามทันที ไม่ต้องแจ้งเตือน**
+- **ห้ามส่งข้อความแจ้งเตือนใดๆ ในคำตอบ**
 
 กรุณาตอบคำถามตามแนวทางที่กำหนดไว้ โดยใช้ความรู้โหราศาสตร์ตะวันตกและให้คำแนะนำที่เป็นประโยชน์"""
         else:
             astrology_prompt = f"""คุณเป็นโหราจารย์ดิจิทัลผู้เชี่ยวชาญด้านโหราศาสตร์ตะวันตก (Western Astrology) ที่มีความรู้ลึกซึ้งเกี่ยวกับดาวเคราะห์ ราศี และการตีความดวงกำเนิด
 
 **บทบาทและความเชี่ยวชาญ:**
-- คุณมีความเข้าใจในพลังของราศีอาทิตย์ (Sun Sign) และลัคณา (ราศีประจำลัคนา)
+- คุณมีความเข้าใจในพลังของราศีเกิด และลัคณา (ราศีประจำลัคนา)
 - คุณสามารถผสานข้อมูลจากฐานความรู้เพื่อสร้างคำทำนายที่เฉพาะตัว
 - คุณให้คำแนะนำที่อบอุ่น เป็นมิตร และให้กำลังใจ
 - คุณสามารถรักษาบริบทการสนทนาและตอบคำถามต่อเนื่องได้อย่างเป็นธรรมชาติ
@@ -1474,15 +1367,17 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
 **คำถามของผู้ใช้:** {question}
 
 **วิธีการตอบคำถาม:**
-1. **สำหรับคำถามใหม่:** เริ่มต้นด้วยการระบุวันเกิดและราศีอาทิตย์อย่างชัดเจน
-2. **สำหรับคำถามต่อเนื่อง:** ใช้ข้อมูลราศีที่มีอยู่แล้วและตอบคำถามเฉพาะเจาะจง
-3. อธิบายลักษณะนิสัยตามราศีและธาตุ โดยอ้างอิงจากข้อมูลในฐานความรู้
-4. **หากมีข้อมูล Ascendant:** ใช้ข้อมูล Ascendant เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ
-5. ใช้ภาษาที่เป็นธรรมชาติ อ่อนโยน และเข้าใจง่าย
-6. หลีกเลี่ยงคำทำนายเชิงโชคชะตาเด็ดขาด ใช้คำว่า "มีแนวโน้ม", "สะท้อนว่า", "บ่งบอกถึงพลังของ..."
-7. ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
-8. ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ
-9. **สำหรับคำถามต่อเนื่อง:** อย่าเปลี่ยนราศีหรือข้อมูลวันเกิด ให้ใช้ข้อมูลเดิมที่ผู้ใช้ให้มา
+1. **สำหรับคำถามใหม่:** เริ่มต้นด้วยการระบุวันเกิดและราศีเกิดอย่างชัดเจน
+2. **สำหรับคำถามทั่วไปเกี่ยวกับดวงชะตา:** ต้องตอบครบทั้ง 4 ด้าน (ลักษณะนิสัยและบุคลิกภาพ, การงาน, การเงิน, ความรัก) เพื่อให้คำทำนายที่สมบูรณ์
+3. **สำหรับคำถามเฉพาะด้าน:** ตอบเฉพาะด้านที่ถามเท่านั้น (ถ้าถามเกี่ยวกับการงาน ก็ตอบเฉพาะการงาน เท่านั้น)
+4. **สำหรับคำถามต่อเนื่อง:** ใช้ข้อมูลราศีที่มีอยู่แล้วและตอบคำถามเฉพาะเจาะจง
+5. อธิบายลักษณะนิสัยตามราศีและธาตุ โดยอ้างอิงจากข้อมูลในฐานความรู้
+6. **หากมีข้อมูล Ascendant:** ใช้ข้อมูล Ascendant เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ
+7. ใช้ภาษาที่เป็นธรรมชาติ อ่อนโยน และเข้าใจง่าย
+8. หลีกเลี่ยงคำทำนายเชิงโชคชะตาเด็ดขาด ใช้คำว่า "มีแนวโน้ม", "สะท้อนว่า", "บ่งบอกถึงพลังของ..."
+9. ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้หัวข้อหรือหมวดหมู่
+10. ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ
+11. **สำหรับคำถามต่อเนื่อง:** อย่าเปลี่ยนราศีหรือข้อมูลวันเกิด ให้ใช้ข้อมูลเดิมที่ผู้ใช้ให้มา
 
 **การจัดการคำถามต่อเนื่อง:**
 - ถ้าผู้ใช้ถามเกี่ยวกับ "ราศีนี้", "นิสัย", "ลักษณะ", "คนราศีนี้" โดยไม่ระบุราศี ให้ใช้ราศีจากข้อมูลบริบท
@@ -1502,22 +1397,26 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
 - **คำลงท้ายต้องใช้ "ค่ะ" เท่านั้น ห้ามใช้ "ครับ/ค่ะ" หรือ "ครับ"**
 
 **การจัดการข้อมูลที่ไม่ครบ:**
-- หากไม่มีข้อมูลวันเกิดหรือราศี ให้แจ้งเตือนผู้ใช้ให้ระบุข้อมูลก่อน
-- ใช้ข้อความ: "ขออภัยค่ะ ระบบไม่พบข้อมูลราศีของคุณ กรุณาระบุวันเกิดก่อน เช่น '09/02/2004 ราศีอะไร'"
+- **หากไม่มีข้อมูลวันเกิดหรือราศีในคำถาม:**
+  - ห้ามสร้างข้อมูลราศีหรือวันเกิดใหม่
+  - ห้ามแจ้งเตือนผู้ใช้ในเนื้อหาของคำตอบ
+  - ให้ส่งคำตอบแบบปกติโดยใช้ข้อมูลที่มีอยู่เท่านั้น
 - หากมีข้อมูลบางส่วนไม่ครบ ให้ใช้ความรู้โหราศาสตร์ทั่วไปในการให้คำแนะนำ
-- ห้ามใช้ข้อความเช่น "ไม่มีข้อมูลเพิ่มเติม", "ไม่สามารถให้คำแนะนำเฉพาะได้", "ข้อมูลไม่เพียงพอ" เว้นแต่จะไม่มีข้อมูลวันเกิดหรือราศีเลย
+- ห้ามใช้ข้อความเช่น "ไม่มีข้อมูลเพิ่มเติม", "ไม่สามารถให้คำแนะนำเฉพาะได้", "ข้อมูลไม่เพียงพอ" ในคำตอบ
 
 กรุณาตอบคำถามตามแนวทางที่กำหนดไว้ โดยใช้ความรู้โหราศาสตร์ตะวันตกและให้คำแนะนำที่เป็นประโยชน์"""
         
         # สร้าง system prompt ที่เหมาะสม
         if astrology_chart:
-            system_prompt = f"""คุณเป็นแชทบอทโหราศาสตร์ตะวันตกที่เชี่ยวชาญในการทำนายดวงชะตาจากวันเดือนปีเกิด ตอบคำถามด้วยภาษาที่เป็นมิตร เป็นธรรมชาติ และเข้าใจง่าย เริ่มต้นด้วยการระบุวันเกิดและราศีอาทิตย์อย่างชัดเจน แล้วอธิบายลักษณะนิสัยและให้คำแนะนำในด้านต่างๆ (การงาน, การเงิน, ความรัก, สุขภาพ, สีมงคล) ตามรูปแบบที่กำหนดไว้ ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ ในคำตอบ ให้ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้รูปแบบหัวข้อหรือหมวดหมู่ **ใช้ชื่อราศีแบบไทยเท่านั้น: เมษ, พฤษภ, เมถุน, กรกฎ, สิงห์, กันย์, ตุล, พิจิก, ธนู, มังกร, กุมภ์, มีน ห้ามใช้ชื่อสัตว์ เช่น ราศีปลา, ราศีแกะ, ราศีวัว สำหรับราศีที่ 12 ต้องใช้ ราศีมีน เท่านั้น ห้ามใช้คำว่า ราศีปลา หรือ Pisces** **ใช้คำว่า 'ลัคณา' แทน 'Ascendant' ในทุกกรณี** **หากมีข้อมูลลัคณา (ราศีประจำลัคนา) ให้ใช้เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ** **คำลงท้ายต้องใช้ 'ค่ะ' เท่านั้น ห้ามใช้ 'ครับ/ค่ะ' หรือ 'ครับ'**"""
+            system_prompt = f"""คุณเป็นแชทบอทโหราศาสตร์ตะวันตกที่เชี่ยวชาญในการทำนายดวงชะตาจากวันเดือนปีเกิด ตอบคำถามด้วยภาษาที่เป็นมิตร เป็นธรรมชาติ และเข้าใจง่าย เริ่มต้นด้วยการระบุวันเกิดและราศีอาทิตย์อย่างชัดเจน แล้วอธิบายลักษณะนิสัยและให้คำแนะนำในด้านต่างๆ (การงาน, การเงิน, ความรัก) ตามรูปแบบที่กำหนดไว้ ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ ในคำตอบ ให้ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้รูปแบบหัวข้อหรือหมวดหมู่ **ใช้ชื่อราศีแบบไทยเท่านั้น: เมษ, พฤษภ, เมถุน, กรกฎ, สิงห์, กันย์, ตุล, พิจิก, ธนู, มังกร, กุมภ์, มีน ห้ามใช้ชื่อสัตว์ เช่น ราศีปลา, ราศีแกะ, ราศีวัว สำหรับราศีที่ 12 ต้องใช้ ราศีมีน เท่านั้น ห้ามใช้คำว่า ราศีปลา หรือ Pisces** **ใช้คำว่า 'ลัคณา' แทน 'Ascendant' ในทุกกรณี** **หากมีข้อมูลลัคณา (ราศีประจำลัคนา) ให้ใช้เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ** **คำลงท้ายต้องใช้ 'ค่ะ' เท่านั้น ห้ามใช้ 'ครับ/ค่ะ' หรือ 'ครับ'**"""
         else:
-            system_prompt = """คุณเป็นแชทบอทโหราศาสตร์ตะวันตกที่เชี่ยวชาญในการทำนายดวงชะตาจากวันเดือนปีเกิด ตอบคำถามด้วยภาษาที่เป็นมิตร เป็นธรรมชาติ และเข้าใจง่าย เริ่มต้นด้วยการระบุวันเกิดและราศีอาทิตย์อย่างชัดเจน แล้วอธิบายลักษณะนิสัยและให้คำแนะนำในด้านต่างๆ (การงาน, การเงิน, ความรัก, สุขภาพ, สีมงคล) ตามรูปแบบที่กำหนดไว้ ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ ในคำตอบ ให้ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้รูปแบบหัวข้อหรือหมวดหมู่ **ใช้ชื่อราศีแบบไทยเท่านั้น: เมษ, พฤษภ, เมถุน, กรกฎ, สิงห์, กันย์, ตุล, พิจิก, ธนู, มังกร, กุมภ์, มีน ห้ามใช้ชื่อสัตว์ เช่น ราศีปลา, ราศีแกะ, ราศีวัว สำหรับราศีที่ 12 ต้องใช้ ราศีมีน เท่านั้น ห้ามใช้คำว่า ราศีปลา หรือ Pisces** **ใช้คำว่า 'ลัคณา' แทน 'Ascendant' ในทุกกรณี** **หากมีข้อมูลลัคณา (ราศีประจำลัคนา) ให้ใช้เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ** **หากไม่มีข้อมูลวันเกิดหรือราศี ให้แจ้งเตือนผู้ใช้ให้ระบุข้อมูลก่อน เช่น 'ขออภัยค่ะ ระบบไม่พบข้อมูลราศีของคุณ กรุณาระบุวันเกิดก่อน เช่น 09/02/2004 ราศีอะไร'** **คำลงท้ายต้องใช้ 'ค่ะ' เท่านั้น ห้ามใช้ 'ครับ/ค่ะ' หรือ 'ครับ'**"""
+            system_prompt = """คุณเป็นแชทบอทโหราศาสตร์ตะวันตกที่เชี่ยวชาญในการทำนายดวงชะตาจากวันเดือนปีเกิด ตอบคำถามด้วยภาษาที่เป็นมิตร เป็นธรรมชาติ และเข้าใจง่าย เริ่มต้นด้วยการระบุวันเกิดและราศีอาทิตย์อย่างชัดเจน แล้วอธิบายลักษณะนิสัยและให้คำแนะนำในด้านต่างๆ (การงาน, การเงิน, ความรัก) ตามรูปแบบที่กำหนดไว้ ห้ามใช้ emoji หรือสัญลักษณ์พิเศษใดๆ ในคำตอบ ให้ตอบเป็นข้อความต่อเนื่องแบบธรรมชาติ ไม่ใช้รูปแบบหัวข้อหรือหมวดหมู่ **ใช้ชื่อราศีแบบไทยเท่านั้น: เมษ, พฤษภ, เมถุน, กรกฎ, สิงห์, กันย์, ตุล, พิจิก, ธนู, มังกร, กุมภ์, มีน ห้ามใช้ชื่อสัตว์ เช่น ราศีปลา, ราศีแกะ, ราศีวัว สำหรับราศีที่ 12 ต้องใช้ ราศีมีน เท่านั้น ห้ามใช้คำว่า ราศีปลา หรือ Pisces** **ใช้คำว่า 'ลัคณา' แทน 'Ascendant' ในทุกกรณี** **หากมีข้อมูลลัคณา (ราศีประจำลัคนา) ให้ใช้เพื่อเพิ่มความแม่นยำในการทำนายบุคลิกภาพ** **หากไม่มีข้อมูลวันเกิดหรือราศี ให้แจ้งเตือนผู้ใช้ให้ระบุข้อมูลก่อน เช่น 'ขออภัยค่ะ ระบบไม่พบข้อมูลราศีของคุณ กรุณาระบุวันเกิดก่อน เช่น 09/02/2004 ราศีอะไร'** **คำลงท้ายต้องใช้ 'ค่ะ' เท่านั้น ห้ามใช้ 'ครับ/ค่ะ' หรือ 'ครับ'**"""
         
         # print("กำลังส่งคำถามไปยัง GPT...")
+        # ใช้ชื่อโมเดลจาก ENV ถ้าไม่ระบุจะใช้ gpt-4o-mini
+        openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model=openai_model,
             messages=[
                 {
                     "role": "system", 
@@ -1531,24 +1430,10 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
         answer = response.choices[0].message.content
         # print(f"ได้รับคำตอบจาก GPT (ความยาว: {len(answer)} ตัวอักษร)")
         
-        # เพิ่มข้อมูลจำนวนคำถามที่เหลือ
-        remaining_questions = 3 - current_count
-        if remaining_questions > 0:
-            answer += f"\n\nคุณสามารถถามคำถามได้อีก {remaining_questions} คำ..."
-        elif remaining_questions == 0:
-            answer += f"\n\n⚠️ นี่เป็นคำถามสุดท้ายของคุณในวันนี้"
-        
         # ไม่ใช้ฟังก์ชันจัดรูปแบบเพื่อให้ GPT สร้างคำตอบแบบธรรมชาติ
         
         # แสดงสรุปแหล่งที่มาของข้อมูล
-        if retrieved_docs:
-            print(f"=== สรุปแหล่งที่มาของข้อมูล ===")
-            for i, doc in enumerate(retrieved_docs):
-                if isinstance(doc, dict):
-                    print(f"เอกสารที่ {i+1}: {doc['source']} (Similarity: {doc['similarity']:.4f})")
-                else:
-                    print(f"เอกสารที่ {i+1}: ข้อมูลทั่วไป")
-            print(f"=== เสร็จสิ้นการสรุปแหล่งที่มา ===")
+        # รายงานแหล่งที่มาจะรวมอยู่ในรายงานหลักด้านล่าง
         
         # ไม่เพิ่ม emoji ใดๆ เพื่อให้คำตอบสะอาดตา
         
@@ -1563,11 +1448,40 @@ def ask_question_to_rag(question: str, user_id: str = "unknown") -> str:
                     answer += f"• {q}\n"
             
     except Exception as gpt_error:
-        # print(f"DEBUG - Error in GPT processing: {gpt_error}")
-        # print(f"DEBUG - Error type: {type(gpt_error)}")
-        # import traceback
-        # print(f"DEBUG - Traceback: {traceback.format_exc()}")
-        answer = "ขออภัยค่ะ เกิดปัญหาในการประมวลผล กรุณาลองใหม่อีกครั้ง"
+        # Fallback: ตอบแบบพื้นฐานโดยไม่ใช้ LLM
+        try:
+            # หากมีข้อมูลดวงชะตาอยู่แล้ว ให้สร้างคำตอบสั้นๆ จากข้อมูลนั้น
+            if astrology_chart and astrology_chart.get('zodiac_sign'):
+                zodiac = astrology_chart['zodiac_sign']
+                birth_date_text = astrology_chart.get('birth_date', '')
+                answer = f"วันเกิด: {birth_date_text}\nราศีของคุณคือ ราศี{zodiac}"
+            else:
+                # พยายามดึงวันเกิดจากคำถาม และคำนวณราศีแบบ local
+                from .birth_date_parser import BirthDateParser
+                parser = BirthDateParser()
+                info = parser.extract_birth_info(question)
+                if info and info.get('date'):
+                    chart = parser.generate_birth_chart_info(info['date'], info.get('time'), info.get('latitude', 13.7563), info.get('longitude', 100.5018))
+                    if chart and chart.get('zodiac_sign'):
+                        answer = f"วันเกิด: {info['date']}\nราศีของคุณคือ ราศี{chart['zodiac_sign']}"
+                    else:
+                        answer = "ขออภัยค่ะ ไม่สามารถคำนวณราศีได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง"
+                else:
+                    # ถ้าไม่มีวันเกิดในคำถาม ให้ตอบแบบทั่วไปโดยไม่หยุดการสนทนา
+                    answer = "คุณสามารถบอกวันเกิดในรูปแบบ 07/09/2003 เพื่อให้บอกว่าราศีอะไรได้ค่ะ"
+        except Exception:
+            answer = "ขออภัยค่ะ เกิดปัญหาในการประมวลผล กรุณาลองใหม่อีกครั้ง"
+
+    # แสดงรายงานบนเทอร์มินัลสำหรับ RAGAS
+    try:
+        print_ragas_terminal_report(
+            question=question,
+            retrieved_docs=retrieved_docs,
+            answer=answer,
+            user_id=user_id,
+        )
+    except Exception:
+        pass
 
     # บันทึก interaction พร้อมข้อมูลบริบท
     try:

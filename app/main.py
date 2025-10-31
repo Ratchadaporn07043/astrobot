@@ -70,28 +70,37 @@ def on_message_event(event: MessageEvent):
             )
             return
 
-        # ส่งข้อความแจ้งเตือน "กำลังประมวลผล" ก่อน
-        processing_message = TextMessage(text="⏳ กำลังประมวลผลคำถามของคุณ กรุณารอสักครู่...")
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[processing_message]
+        # ถ้าไม่ใช่ quick reply: ตอบกลับสถานะกำลังประมวลผลก่อน แล้วค่อย push คำตอบสุดท้าย
+        try:
+            # ตอบกลับทันทีเพื่อแจ้งสถานะกำลังประมวลผล
+            processing_msg = TextMessage(text="กำลังประมวลผลคำตอบอยู่... โปรดรอสักครู่ค่ะ")
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[processing_msg]
+                )
             )
-        )
+        except Exception:
+            # ถ้าตอบกลับสถานะไม่ได้ ให้ดำเนินการต่อไป
+            pass
 
-        # ถ้าไม่ใช่ quick reply, ไปถาม RAG ปกติ
-        reply_message = generate_reply_message(event)
-        if not reply_message:
+        # สร้างคำตอบจริง แล้ว push ให้ผู้ใช้เมื่อพร้อม
+        final_message = generate_reply_message(event)
+        if not final_message:
             return None
 
-        # ส่งคำตอบจริงด้วย push message
-        user_id = event.source.user_id if event.source and hasattr(event.source, 'user_id') else "unknown"
-        line_bot_api.push_message(
-            PushMessageRequest(
-                to=user_id,
-                messages=[reply_message]
-            )
-        )
+        try:
+            user_id = event.source.user_id if event.source and hasattr(event.source, 'user_id') else None
+            if user_id:
+                line_bot_api.push_message(
+                    PushMessageRequest(
+                        to=user_id,
+                        messages=[final_message]
+                    )
+                )
+        except Exception:
+            # หาก push ไม่สำเร็จ ให้เงียบๆ เพื่อไม่ให้ล้มทั้งงาน
+            pass
 
 
 # ------------------------
@@ -126,8 +135,8 @@ async def ask_route(req: AskRequest):
         
         return {"answer": safety_message}
     
-    # ตรวจสอบจำนวนคำถามต่อเนื่อง
-    is_allowed, current_count, limit_message = check_and_update_question_limit(req.user_id, max_questions=3)
+    # ตรวจสอบจำนวนคำถามต่อเนื่อง (ไม่จำกัดจำนวนครั้ง)
+    is_allowed, current_count, limit_message = check_and_update_question_limit(req.user_id)
     if not is_allowed:
         print(f"🚫 Question limit exceeded for user {req.user_id}: {current_count}/3")
         

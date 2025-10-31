@@ -20,6 +20,17 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# แสดงคำตอบในเทอร์มินัลแบบอ่านง่าย
+def log_pretty_answer(user_id: str, title: str, answer_text: str):
+    try:
+        header = "\n\n🟦================ คำตอบที่ส่งให้ผู้ใช้ ================\n"
+        meta = f"ผู้ใช้: {user_id}\nประเภท: {title}\nความยาว: {len(answer_text)} ตัวอักษร\n"
+        body_header = "────────────────────────────────────────────────────\n"
+        footer = "\n🟦====================================================\n"
+        logging.info(header + meta + body_header + (answer_text or "") + footer)
+    except Exception:
+        pass
+
 # ฟังก์ชัน extract_birth_date_from_message ถูกย้ายไปที่ birth_date_parser.py แล้ว
 def get_or_create_user_profile(user_id: str, user_message: str = None):
     """ตรวจสอบ/สร้าง user profile ด้วยวันเกิด"""
@@ -74,22 +85,14 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
                         if birth_chart_prediction and not birth_chart_prediction.startswith("ไม่สามารถ"):
                             logger.info(f"สร้างคำทำนายดวงกำเนิดสำเร็จ (ความยาว: {len(birth_chart_prediction)} ตัวอักษร)")
                             
-                            # บันทึกคำถามใน user_profiles
+                            # บันทึกคำถามใน user_profiles (เก็บบริบทเท่านั้น ไม่บันทึก response ต้นทาง)
                             store_user_question(
                                 question=user_message,
                                 user_id=user_id,
                                 context_data={"birth_date": birth_date}
                             )
                             
-                            # บันทึกคำตอบใน collection astrobot
-                            store_user_response(
-                                question=user_message,
-                                answer=birth_chart_prediction,
-                                user_id=user_id,
-                                response_type="birth_chart",
-                                context_data={"birth_date": birth_date}
-                            )
-                            
+                            # log_pretty_answer(user_id, "birth_chart", birth_chart_prediction)
                             return birth_chart_prediction
                         else:
                             logger.warning(f"ไม่สามารถสร้างคำทำนายดวงกำเนิดได้: {birth_chart_prediction}")
@@ -128,30 +131,54 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
                 try:
                     logger.info(f"กำลังตอบคำถามโหราศาสตร์สำหรับ: {user_message}")
                     from .retrieval_utils import ask_question_to_rag
-                    astrology_answer = ask_question_to_rag(user_message, user_id)
+                    from .birth_date_parser import BirthDateParser
+                    
+                    # สร้าง chart_info เพื่อส่งไปยัง ask_question_to_rag
+                    parser = BirthDateParser()
+                    birth_info_extracted = parser.extract_birth_info(user_message)
+                    chart_info_for_rag = None
+                    
+                    if birth_info_extracted and birth_info_extracted.get('date'):
+                        chart_info_for_rag = parser.generate_birth_chart_info(
+                            birth_info_extracted['date'],
+                            birth_info_extracted.get('time'),
+                            birth_info_extracted.get('latitude', 13.7563),
+                            birth_info_extracted.get('longitude', 100.5018)
+                        )
+                        if chart_info_for_rag:
+                            logger.info(f"สร้าง chart_info สำหรับ RAG สำเร็จ: ราศี{chart_info_for_rag['zodiac_sign']}")
+                    
+                    # ส่ง chart_info ไปกับคำถามถ้ามี
+                    if chart_info_for_rag:
+                        astrology_answer = ask_question_to_rag(user_message, user_id, provided_chart_info=chart_info_for_rag)
+                    else:
+                        astrology_answer = ask_question_to_rag(user_message, user_id)
+                    
                     logger.info(f"ได้รับคำตอบโหราศาสตร์ (ความยาว: {len(astrology_answer)} ตัวอักษร)")
                     
-                    # เพิ่มข้อมูลลัคณาในคำตอบถ้ามี
-                    if ascendant_info:
+                    # เพิ่มข้อมูลลัคณาในคำตอบถ้ามี และไม่ใช่ข้อความแจ้งเตือน
+                    is_error_message = (
+                        astrology_answer.startswith("ขออภัยค่ะ ระบบไม่พบข้อมูล") or
+                        astrology_answer.startswith("ขออภัยค่ะ ระบบไม่พบข้อมูลบริบท") or
+                        astrology_answer.startswith("ขออภัยค่ะ ระบบไม่พบข้อมูลราศี") or
+                        astrology_answer.startswith("ขออภัยครับ")  # คำสั่งจำกัดคำถาม
+                    )
+                    
+                    if ascendant_info and not is_error_message:
                         astrology_answer += ascendant_info
                         logger.info("✅ Added ascendant info to astrology answer")
+                    elif ascendant_info and is_error_message:
+                        logger.info("⚠️ Skipped adding ascendant info due to error message")
                     
-                    # บันทึกคำถามใน user_profiles
+                    # บันทึกเฉพาะคำตอบสุดท้ายเท่านั้น (astrology_answer) จะถูกบันทึกโดยชั้นล่างใน ask_question_to_rag
+                    # อัปเดตบริบทคำถามล่าสุดไว้ในโปรไฟล์
                     store_user_question(
                         question=user_message,
                         user_id=user_id,
                         context_data={"birth_date": birth_date}
                     )
                     
-                    # บันทึกคำตอบใน collection astrobot
-                    store_user_response(
-                        question=user_message,
-                        answer=astrology_answer,
-                        user_id=user_id,
-                        response_type="astrology_qa",
-                        context_data={"birth_date": birth_date}
-                    )
-                    
+                    # log_pretty_answer(user_id, "astrology_qa", astrology_answer)
                     return astrology_answer
                 except Exception as e:
                     logger.warning(f"Could not get astrology answer: {e}")
@@ -168,14 +195,12 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
 
 ลองถามอะไรก็ได้นะครับ!"""
                     
-                    # บันทึกคำถามใน user_profiles
+                    # ข้อความต้อนรับนี้เป็นคำตอบสุดท้าย กรณีนี้ไม่มีชั้นล่างบันทึก จึงยังคงบันทึกได้
                     store_user_question(
                         question=user_message,
                         user_id=user_id,
                         context_data={"birth_date": birth_date}
                     )
-                    
-                    # บันทึกคำตอบใน collection astrobot
                     store_user_response(
                         question=user_message,
                         answer=welcome_message,
@@ -184,6 +209,7 @@ def get_or_create_user_profile(user_id: str, user_message: str = None):
                         context_data={"birth_date": birth_date}
                     )
                     
+                    # log_pretty_answer(user_id, "welcome_message", welcome_message)
                     return welcome_message
             
             # ถ้าไม่พบวันเกิดในข้อความ แต่ผู้ใช้มี profile อยู่แล้ว ให้ผ่านไปให้ RAG จัดการ
@@ -296,6 +322,7 @@ def generate_reply_message(event):
             context_data={"filter_reason": "unsafe_content"}
         )
         
+        # log_pretty_answer(user_id, "content_filtered", safety_message)
         return TextMessage(text=safety_message)
 
     # ตรวจสอบ/สร้างโปรไฟล์ก่อนใช้งาน
@@ -303,8 +330,30 @@ def generate_reply_message(event):
     if profile_status:
         return TextMessage(text=profile_status)
 
-    # ตรวจสอบจำนวนคำถามต่อเนื่อง (เฉพาะเมื่อไม่ใช่การสร้างโปรไฟล์)
-    is_allowed, current_count, limit_message = check_and_update_question_limit(user_id, max_questions=3)
+    # ข้อความนี้เป็นทางลัด แต่ตอนนี้เราต้องการให้คำถามที่มีวันเกิดเรียก LLM เสมอเพื่อให้คำทำนายที่ครบถ้วน
+    # ดังนั้นเราจะลบทางลัดนี้ออกและให้ทุกคำถามที่มีวันเกิดเรียก LLM
+    # try:
+    #     if "ราศี" in user_text:
+    #         from .birth_date_parser import BirthDateParser
+    #         parser = BirthDateParser()
+    #         info = parser.extract_birth_info(user_text)
+    #         if info and info.get('date'):
+    #             chart = parser.generate_birth_chart_info(info['date'], info.get('time'), info.get('latitude', 13.7563), info.get('longitude', 100.5018))
+    #             if chart and chart.get('zodiac_sign'):
+    #                 local_reply = f"วันเกิด: {info['date']}\nราศีของคุณคือ ราศี{chart['zodiac_sign']}"
+    #                 # บันทึกคำถาม/คำตอบแบบย่อเพื่อบริบทต่อเนื่อง (ถ้าต่อกับ DB ได้)
+    #                 try:
+    #                     store_user_question(question=user_text, user_id=user_id, context_data={"birth_date": info['date']})
+    #                     store_user_response(question=user_text, answer=local_reply, user_id=user_id, response_type="local_zodiac", context_data={"zodiac_sign": chart['zodiac_sign'], "birth_date": info['date']})
+    #                 except Exception:
+    #                     pass
+    #                 log_pretty_answer(user_id, "local_zodiac", local_reply)
+    #                 return TextMessage(text=local_reply)
+    # except Exception as e:
+    #     logger.warning(f"Local zodiac fallback failed: {e}")
+
+    # ตรวจสอบจำนวนคำถามต่อเนื่อง (ไม่จำกัดจำนวนครั้ง)
+    is_allowed, current_count, limit_message = check_and_update_question_limit(user_id)
     if not is_allowed:
         logger.info(f"🚫 Question limit exceeded for user {user_id}: {current_count}/3")
         
@@ -324,6 +373,7 @@ def generate_reply_message(event):
             context_data={"question_count": current_count, "max_questions": 3}
         )
         
+        # log_pretty_answer(user_id, "question_limit_exceeded", limit_message)
         return TextMessage(text=limit_message)
 
     # ถ้ามี profile แล้ว ให้ถามตอบได้ผ่าน RAG
@@ -336,33 +386,22 @@ def generate_reply_message(event):
                 logger.info(f"สร้างคำทำนายดวงกำเนิดสำเร็จ (ความยาว: {len(birth_chart_prediction)} ตัวอักษร)")
                 reply_text = birth_chart_prediction
                 
-                # บันทึกคำถามใน user_profiles
+                # เก็บบริบทคำถามไว้ แต่ไม่บันทึก response ต้นทาง เพื่อให้เก็บเฉพาะคำตอบสุดท้าย
                 store_user_question(
                     question=user_text,
                     user_id=user_id,
-                    context_data={"prediction_type": "birth_chart"}
-                )
-                
-                # บันทึกคำตอบใน collection astrobot
-                store_user_response(
-                    question=user_text,
-                    answer=reply_text,
-                    user_id=user_id,
-                    response_type="birth_chart_prediction",
                     context_data={"prediction_type": "birth_chart"}
                 )
             else:
                 logger.warning(f"ไม่สามารถสร้างคำทำนายดวงกำเนิดได้: {birth_chart_prediction}")
                 reply_text = birth_chart_prediction or "ไม่สามารถสร้างคำทำนายดวงกำเนิดได้ กรุณาระบุวันเกิดที่ชัดเจน"
                 
-                # บันทึกคำถามใน user_profiles
+                # กรณีล้มเหลว ข้อความนี้เป็นคำตอบสุดท้าย จึงยังคงบันทึกได้
                 store_user_question(
                     question=user_text,
                     user_id=user_id,
                     context_data={"error_type": "prediction_failed"}
                 )
-                
-                # บันทึกคำตอบใน collection astrobot
                 store_user_response(
                     question=user_text,
                     answer=reply_text,
@@ -373,9 +412,20 @@ def generate_reply_message(event):
         else:
             logger.info(f"กำลังประมวลผลคำถาม: {user_text}")
             reply_text = ask_question_to_rag(user_text, user_id=user_id)
+            # ป้องกันกรณีที่คำตอบไม่ใช่สตริง หรือเป็น None
+            if not isinstance(reply_text, str):
+                logger.warning(f"reply_text is not str (type={type(reply_text)}), coercing to string")
+                reply_text = "" if reply_text is None else str(reply_text)
             logger.info(f"ได้รับคำตอบ (ความยาว: {len(reply_text)} ตัวอักษร)")
     except Exception as e:
+        import traceback
         logger.error(f"Error in processing: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        # บันทึกบริบทสำคัญช่วยดีบัก
+        try:
+            logger.error(f"DEBUG context -> user_id={user_id}, text_len={len(user_text)}, has_openai_key={bool(os.getenv('OPENAI_API_KEY'))}, model={os.getenv('OPENAI_MODEL', 'gpt-4o-mini')}")
+        except Exception:
+            pass
         reply_text = "ขออภัยครับ เกิดปัญหาในการประมวลผล กรุณาลองใหม่อีกครั้ง"
         
         # บันทึกคำถามใน user_profiles
@@ -394,4 +444,8 @@ def generate_reply_message(event):
             context_data={"error_type": "processing_error", "error_details": str(e)}
         )
     
+    # try:
+    #     log_pretty_answer(user_id, "final_reply", reply_text)
+    # except Exception:
+    #     pass
     return TextMessage(text=reply_text)

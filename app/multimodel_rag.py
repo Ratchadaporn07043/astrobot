@@ -554,97 +554,326 @@ def store_processed_to_json(chunks, collection_name):
     except Exception as e:
         print(f"❗ Error saving processed data to JSON: {e}")
 
-# ✅ ฟังก์ชันหลัก
+# ✅ ฟังก์ชันประมวลผลหน้าเดียว (ตาม flow ที่ออกแบบ)
+def process_single_page(page_num, pymupdf_page, pdfplumber_pdf, ocr_reader, doc_id_counter):
+    """
+    ประมวลผลหน้าเดียว: Extract → Summary → Embedding → Store
+    ตาม flow ที่ออกแบบ: ทำหน้าแล้วทำ summary/embedding ทันที
+    
+    Args:
+        page_num: หมายเลขหน้าที่กำลังประมวลผล (0-based)
+        pymupdf_page: หน้า PDF จาก PyMuPDF
+        pdfplumber_pdf: PDF object จาก pdfplumber
+        ocr_reader: OCR reader สำหรับประมวลผลรูปภาพ
+        doc_id_counter: counter สำหรับสร้าง doc_id
+        
+    Returns:
+        dict: {
+            'has_content': bool,  # มีเนื้อหาหรือไม่ (สำหรับตรวจสอบหน้าเปล่า)
+            'text_chunks': list,
+            'image_chunks': list,
+            'table_chunks': list,
+            'text_processed_chunks': list,
+            'image_processed_chunks': list,
+            'table_processed_chunks': list
+        }
+    """
+    page_results = {
+        'has_content': False,
+        'text_chunks': [],
+        'image_chunks': [],
+        'table_chunks': [],
+        'text_processed_chunks': [],
+        'image_processed_chunks': [],
+        'table_processed_chunks': []
+    }
+    
+    try:
+        print(f"\n{'='*50}")
+        print(f"📄 กำลังประมวลผลหน้า {page_num + 1}")
+        print(f"{'='*50}")
+        
+        # === EXTRACT: Text, Images, Tables จากหน้าเดียวกัน ===
+        # 1. Extract Text (เจออะไรก่อนทำอันนั้น)
+        page_text = pymupdf_page.get_text("text")
+        if page_text.strip():
+            page_results['has_content'] = True
+            print(f"✅ พบ Text: {len(page_text)} ตัวอักษร")
+            
+            # Create text chunk
+            text_chunk = {
+                "text": page_text.strip(),
+                "type": "text",
+                "chunk_id": len(page_results['text_chunks']),
+                "page": page_num + 1,
+                "doc_id": f"doc_{doc_id_counter}_{page_num + 1}_text"
+            }
+            page_results['text_chunks'].append(text_chunk)
+            
+            # สร้าง summary และ embeddings ทันที
+            summary_text = summarize_with_openai(text_chunk["text"], "text")
+            text_processed_chunk = text_chunk.copy()
+            text_processed_chunk["summary"] = summary_text
+            text_processed_chunk["embeddings"] = create_embeddings(summary_text)
+            text_processed_chunk["created_at"] = datetime.now()
+            page_results['text_processed_chunks'].append(text_processed_chunk)
+            print(f"   ✅ สร้าง summary และ embeddings แล้ว")
+        
+        # 2. Extract Images (เจออะไรก่อนทำอันนั้น)
+        images = pymupdf_page.get_images(full=True)
+        print(f"🔍 พบ {len(images)} รูปในหน้านี้")
+        
+        for img_index, img in enumerate(images):
+            try:
+                xref = img[0]
+                base_image = pymupdf_page.parent.extract_image(xref)
+                image_bytes = base_image["image"]
+                
+                # ตรวจสอบขนาดรูปภาพ
+                image = Image.open(io.BytesIO(image_bytes))
+                width, height = image.size
+                
+                # ข้ามรูปที่ใหญ่เกินไป
+                if width * height > 1500000:
+                    print(f"⚠️ ข้ามรูปใหญ่ {img_index + 1} ({width}x{height})")
+                    continue
+                
+                # ข้ามรูปที่เล็กเกินไป
+                if width < 50 or height < 50:
+                    print(f"⚠️ ข้ามรูปเล็ก {img_index + 1} ({width}x{height})")
+                    continue
+                
+                # OCR
+                ocr_results = ocr_reader.readtext(image_bytes)
+                ocr_text = " ".join([result[1] for result in ocr_results if result[2] > 0.3])
+                
+                if ocr_text.strip():
+                    page_results['has_content'] = True
+                    # ปรับปรุงข้อความด้วย PyThaiNLP
+                    improved_text = improve_thai_ocr_text(ocr_text)
+                    
+                    print(f"✅ รูป {img_index + 1}: {len(improved_text)} ตัวอักษร")
+                    
+                    # Create image chunk
+                    image_chunk = {
+                        "text": improved_text,
+                        "type": "image",
+                        "chunk_id": len(page_results['image_chunks']),
+                        "page": page_num + 1,
+                        "image_index": img_index + 1,
+                        "original_text": ocr_text.strip(),
+                        "improved_text": improved_text,
+                        "image_base64": base64.b64encode(image_bytes).decode("utf-8"),
+                        "doc_id": f"doc_{doc_id_counter}_{page_num + 1}_img_{img_index + 1}"
+                    }
+                    page_results['image_chunks'].append(image_chunk)
+                    
+                    # สร้าง summary และ embeddings ทันที
+                    summary_text = summarize_with_openai(image_chunk["text"], "image")
+                    image_processed_chunk = image_chunk.copy()
+                    image_processed_chunk["summary"] = summary_text
+                    image_processed_chunk["embeddings"] = create_embeddings(summary_text)
+                    image_processed_chunk["created_at"] = datetime.now()
+                    page_results['image_processed_chunks'].append(image_processed_chunk)
+                    print(f"   ✅ สร้าง summary และ embeddings แล้ว")
+                
+                # ล้าง memory
+                del image, image_bytes, ocr_results
+                
+            except Exception as e:
+                print(f"❗ Error processing image {img_index + 1} on page {page_num + 1}: {e}")
+                continue
+        
+        # 3. Extract Tables (เจออะไรก่อนทำอันนั้น)
+        if page_num < len(pdfplumber_pdf.pages):
+            pdfplumber_page = pdfplumber_pdf.pages[page_num]
+            tables = pdfplumber_page.extract_tables()
+            print(f"🔍 พบ {len(tables)} ตารางในหน้านี้")
+            
+            for table_index, table in enumerate(tables):
+                if table:
+                    # แปลงตารางเป็นข้อความ
+                    table_text = ""
+                    for row in table:
+                        if row:
+                            row_text = " | ".join([cell if cell else "" for cell in row])
+                            table_text += row_text + "\n"
+                    
+                    if table_text.strip():
+                        page_results['has_content'] = True
+                        print(f"✅ ตาราง {table_index + 1}: {len(table_text)} ตัวอักษร")
+                        
+                        # Create table chunk
+                        table_chunk = {
+                            "text": table_text.strip(),
+                            "type": "table",
+                            "chunk_id": len(page_results['table_chunks']),
+                            "page": page_num + 1,
+                            "table_index": table_index + 1,
+                            "doc_id": f"doc_{doc_id_counter}_{page_num + 1}_table_{table_index + 1}"
+                        }
+                        page_results['table_chunks'].append(table_chunk)
+                        
+                        # สร้าง summary และ embeddings ทันที
+                        summary_text = summarize_with_openai(table_chunk["text"], "table")
+                        table_processed_chunk = table_chunk.copy()
+                        table_processed_chunk["summary"] = summary_text
+                        table_processed_chunk["embeddings"] = create_embeddings(summary_text)
+                        table_processed_chunk["created_at"] = datetime.now()
+                        page_results['table_processed_chunks'].append(table_processed_chunk)
+                        print(f"   ✅ สร้าง summary และ embeddings แล้ว")
+        
+        # สรุปผลการประมวลผลหน้า
+        if not page_results['has_content']:
+            print(f"⚠️ หน้า {page_num + 1} เป็นหน้าเปล่า (ไม่มี text, images, หรือ tables)")
+        else:
+            total_chunks = (len(page_results['text_chunks']) + 
+                          len(page_results['image_chunks']) + 
+                          len(page_results['table_chunks']))
+            print(f"✅ ประมวลผลหน้า {page_num + 1} เสร็จ: {total_chunks} chunks")
+        
+        return page_results
+        
+    except Exception as e:
+        print(f"❗ Error processing page {page_num + 1}: {e}")
+        return page_results
+
+# ✅ ฟังก์ชันหลัก (แก้ไขให้ตรงกับ flow ที่ออกแบบ)
 def main():
-    print("🚀 เริ่ม Pipeline: Extract → OCR + PyThaiNLP → Semantic Chunking → Store")
-    print(" TEXT | 🖼️ IMAGE (Improved) | 📊 TABLE")
+    print("🚀 เริ่ม Pipeline: Extract → OCR + PyThaiNLP → Summary → Embedding → Store")
+    print("📄 ประมวลผลหน้าแล้วทำ Summary/Embedding ทันที (ตาม Flow)")
     print()
     
     try:
-        # === STEP 1: EXTRACTION ===
-        print("=== STEP 1: EXTRACTION + OCR IMPROVEMENT ===")
+        # === INITIALIZATION ===
+        print("=== INITIALIZATION ===")
         check_memory()
         
-        # Extract text
-        pdf_text = extract_text_with_pymupdf(PDF_PATH)
+        # เปิดไฟล์ PDF ทั้ง PyMuPDF และ pdfplumber
+        pymupdf_doc = fitz.open(PDF_PATH)
+        pdfplumber_pdf = pdfplumber.open(PDF_PATH)
+        ocr_reader = get_ocr_reader()
         
-        # Extract images (จำกัดจำนวนเพื่อประหยัด memory)
-        print("🖼️ กำลังแปลงรูปภาพเป็นข้อความ...")
-        images_data = extract_images_with_ocr(PDF_PATH)
+        total_pages = len(pymupdf_doc)
+        print(f"📚 จำนวนหน้าทั้งหมด: {total_pages} หน้า")
         
-        # Extract tables
-        tables_data = extract_tables_with_pdfplumber(PDF_PATH)
+        # ตัวแปรสำหรับเก็บผลลัพธ์ทั้งหมด
+        all_text_chunks = []
+        all_image_chunks = []
+        all_table_chunks = []
+        all_text_processed_chunks = []
+        all_image_processed_chunks = []
+        all_table_processed_chunks = []
         
-        print(f"\n📊 สถิติการ Extract:")
-        print(f"   📝 Text: {len(pdf_text)} ตัวอักษร")
-        print(f"   🖼️ Images: {len(images_data)} รูป")
-        print(f"   📊 Tables: {len(tables_data)} ตาราง")
+        doc_id_counter = 1  # สำหรับสร้าง doc_id
         
-        # === STEP 2: SEMANTIC CHUNKING ===
-        print("\n=== STEP 2: SEMANTIC CHUNKING ===")
+        # === LOOP: More Pages (ตาม flow ที่ออกแบบ) ===
+        print("\n=== STEP 1: PAGE-BY-PAGE PROCESSING ===")
+        for page_num in range(total_pages):
+            # ประมวลผลหน้าเดียว (Extract → Summary → Embedding)
+            page_results = process_single_page(
+                page_num=page_num,
+                pymupdf_page=pymupdf_doc[page_num],
+                pdfplumber_pdf=pdfplumber_pdf,
+                ocr_reader=ocr_reader,
+                doc_id_counter=doc_id_counter
+            )
+            
+            # รวม chunks จากหน้านี้เข้ากับทั้งหมด
+            all_text_chunks.extend(page_results['text_chunks'])
+            all_image_chunks.extend(page_results['image_chunks'])
+            all_table_chunks.extend(page_results['table_chunks'])
+            all_text_processed_chunks.extend(page_results['text_processed_chunks'])
+            all_image_processed_chunks.extend(page_results['image_processed_chunks'])
+            all_table_processed_chunks.extend(page_results['table_processed_chunks'])
+            
+            # ตรวจสอบ memory ทุก 5 หน้า
+            if (page_num + 1) % 5 == 0:
+                check_memory()
+            
+            # ตรวจสอบว่ามีหน้าอื่นอีกไหม (More Pages Decision)
+            if page_num < total_pages - 1:
+                print(f"➡️ มีหน้าอื่นอีก {total_pages - page_num - 1} หน้า")
+            else:
+                print(f"✅ ประมวลผลครบทุกหน้าแล้ว ({total_pages} หน้า)")
+                print("➡️ ส่งเข้าสู่ SentenceTransformer และ MongoDB collection summary")
+        
+        # ปิดไฟล์ PDF
+        pymupdf_doc.close()
+        pdfplumber_pdf.close()
+        
+        # === STEP 2: STORE IN MONGODB ===
+        print("\n=== STEP 2: STORE IN MONGODB ===")
         check_memory()
         
-        # Chunk text
-        text_chunks = semantic_chunking_with_potion(pdf_text, "text", chunk_size=1000, overlap=200)
-        
-        # Chunk images
-        image_chunks = []
-        for img in images_data:
-            chunk = {
-                "text": img["text"],
-                "type": "image",
-                "chunk_id": len(image_chunks),
-                "page": img["page"],
-                "image_index": img["image_index"],
-                "original_text": img.get("original_text", ""),
-                "improved_text": img.get("improved_text", ""),
-                "image_base64": img["image_base64"]
-            }
-            image_chunks.append(chunk)
-        
-        # Chunk tables
-        table_chunks = []
-        for table in tables_data:
-            chunk = {
-                "text": table["text"],
-                "type": "table",
-                "chunk_id": len(table_chunks),
-                "page": table["page"],
-                "table_index": table["table_index"]
-            }
-            table_chunks.append(chunk)
-        
-        print(f"✅ สร้าง chunks สำเร็จ:")
-        print(f"   📝 Text chunks: {len(text_chunks)}")
-        print(f"   🖼️ Image chunks: {len(image_chunks)}")
-        print(f"   Table chunks: {len(table_chunks)}")
-        
-        # === STEP 3: STORE IN MONGODB ===
-        print("\n=== STEP 3: STORE IN MONGODB ===")
-        check_memory()
+        print(f"\n📊 สรุปผลการประมวลผล:")
+        print(f"   📝 Text chunks: {len(all_text_chunks)}")
+        print(f"   🖼️ Image chunks: {len(all_image_chunks)}")
+        print(f"   📊 Table chunks: {len(all_table_chunks)}")
+        print(f"   📊 Processed chunks: {len(all_text_processed_chunks) + len(all_image_processed_chunks) + len(all_table_processed_chunks)}")
         
         # เก็บข้อมูลต้นฉบับใน ORIGINAL_DB_NAME (ไม่มี embeddings และ summary)
         print("\n📁 เก็บข้อมูลต้นฉบับใน ORIGINAL_DB_NAME...")
-        # สร้างสำเนาของ chunks เพื่อไม่ให้มี embeddings และ summary
-        import copy
-        original_text_chunks = copy.deepcopy(text_chunks)
-        original_image_chunks = copy.deepcopy(image_chunks)
-        original_table_chunks = copy.deepcopy(table_chunks)
-        
-        store_original_data_in_mongodb(original_text_chunks, ORIGINAL_TEXT_COLLECTION)
-        store_original_data_in_mongodb(original_image_chunks, ORIGINAL_IMAGE_COLLECTION)
-        store_original_data_in_mongodb(original_table_chunks, ORIGINAL_TABLE_COLLECTION)
+        if all_text_chunks:
+            store_original_data_in_mongodb(all_text_chunks, ORIGINAL_TEXT_COLLECTION)
+        if all_image_chunks:
+            store_original_data_in_mongodb(all_image_chunks, ORIGINAL_IMAGE_COLLECTION)
+        if all_table_chunks:
+            store_original_data_in_mongodb(all_table_chunks, ORIGINAL_TABLE_COLLECTION)
         
         # เก็บข้อมูลที่ประมวลผลแล้ว (มี summary embedding และ summary) ใน SUMMARY_DB_NAME
         print("\n📊 เก็บข้อมูลที่ประมวลผลแล้วใน SUMMARY_DB_NAME...")
-        store_processed_data_in_mongodb(text_chunks, PROCESSED_TEXT_COLLECTION)
-        store_processed_data_in_mongodb(image_chunks, PROCESSED_IMAGE_COLLECTION)
-        store_processed_data_in_mongodb(table_chunks, PROCESSED_TABLE_COLLECTION)
+        print("   (Summary embeddings ถูกสร้างจาก summary text โดยใช้ SentenceTransformer)")
+        if all_text_processed_chunks:
+            # ใช้ store_processed_data_in_mongodb แต่จะข้ามการสร้าง summary/embeddings 
+            # เพราะสร้างไว้แล้วใน process_single_page
+            try:
+                client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
+                client.admin.command('ping')
+                db = client[SUMMARY_DB_NAME]
+                collection = db[PROCESSED_TEXT_COLLECTION]
+                collection.delete_many({})
+                collection.insert_many(all_text_processed_chunks)
+                print(f"✅ บันทึก {len(all_text_processed_chunks)} processed text chunks")
+                client.close()
+            except Exception as e:
+                print(f"❗ Error storing processed text chunks: {e}")
+        
+        if all_image_processed_chunks:
+            try:
+                client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
+                client.admin.command('ping')
+                db = client[SUMMARY_DB_NAME]
+                collection = db[PROCESSED_IMAGE_COLLECTION]
+                collection.delete_many({})
+                collection.insert_many(all_image_processed_chunks)
+                print(f"✅ บันทึก {len(all_image_processed_chunks)} processed image chunks")
+                client.close()
+            except Exception as e:
+                print(f"❗ Error storing processed image chunks: {e}")
+        
+        if all_table_processed_chunks:
+            try:
+                client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
+                client.admin.command('ping')
+                db = client[SUMMARY_DB_NAME]
+                collection = db[PROCESSED_TABLE_COLLECTION]
+                collection.delete_many({})
+                collection.insert_many(all_table_processed_chunks)
+                print(f"✅ บันทึก {len(all_table_processed_chunks)} processed table chunks")
+                client.close()
+            except Exception as e:
+                print(f"❗ Error storing processed table chunks: {e}")
         
         print("\n✅ Pipeline เสร็จสิ้น!")
+        print(f"✅ ข้อมูลทั้งหมดถูกบันทึกใน MongoDB:")
+        print(f"   - Original: {ORIGINAL_DB_NAME}")
+        print(f"   - Summary: {SUMMARY_DB_NAME}")
         
     except Exception as e:
         print(f"❗ Error in main pipeline: {e}")
+        import traceback
+        traceback.print_exc()
         print("🔄 Running garbage collection...")
         gc.collect()
         check_memory()
