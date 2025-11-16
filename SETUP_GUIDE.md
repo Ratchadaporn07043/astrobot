@@ -116,7 +116,6 @@ astrobot/
 ├── app/                    # โค้ดหลัก
 │   ├── main.py            # FastAPI server
 │   ├── response_message.py
-│   ├── quick_reply.py
 │   └── retrieval_utils.py
 ├── data/                   # ข้อมูล
 ├── requirements.txt        # Python packages

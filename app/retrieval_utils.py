@@ -1,11 +1,11 @@
 import os
 import logging
 from datetime import datetime, timedelta, time as dt_time
+from typing import Tuple
 from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from .birth_date_parser import generate_astrology_reading, generate_detailed_astrology_reading, extract_birth_info_from_message
-
 
 # โหลด environment variables
 load_dotenv()
@@ -116,11 +116,14 @@ def store_user_response(
     บันทึกคำตอบที่ใช้ตอบผู้ใช้ใน collection responses (ไม่เก็บคำถาม)
     และอัปเดตข้อมูลใน user_profiles สำหรับการถามคำถามต่อเนื่อง
     
+    🆕 สร้าง embeddings สำหรับ question และ answer เพื่อใช้ในการทำ Semantic Similarity 
+    สำหรับ follow-up detection
+    
     Args:
-        question (str): คำถามของผู้ใช้ (ใช้สำหรับอัปเดต user_profiles เท่านั้น)
+        question (str): คำถามของผู้ใช้ (ใช้สำหรับอัปเดต user_profiles และสร้าง embedding)
         answer (str): คำตอบที่ส่งให้ผู้ใช้
         user_id (str): ID ของผู้ใช้
-        response_type (str): ประเภทของคำตอบ (rag_response, birth_chart, quick_reply, etc.)
+        response_type (str): ประเภทของคำตอบ (rag_response, birth_chart, etc.)
         context_data (dict): ข้อมูลบริบทเพิ่มเติม
     """
     try:
@@ -131,11 +134,22 @@ def store_user_response(
         
         logger.info(f"🔄 Attempting to store response for user {user_id}, type: {response_type}")
         
+        # 🆕 สร้าง embeddings สำหรับ question และ answer เพื่อใช้ใน Semantic Similarity
+        try:
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+            question_embedding = model.encode(question, convert_to_numpy=True).tolist()
+            answer_embedding = model.encode(answer, convert_to_numpy=True).tolist()
+            logger.debug(f"✅ Created embeddings for question and answer (dim: {len(question_embedding)})")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to create embeddings: {e}")
+            question_embedding = None
+            answer_embedding = None
+        
         mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000, connectTimeoutMS=5000)
         responses_collection = mongo_client["astrobot"]["responses"]
         profiles_collection = mongo_client["astrobot"]["user_profiles"]
         
-        # สร้างข้อมูลสำหรับบันทึกใน responses (ไม่เก็บคำถาม)
+        # สร้างข้อมูลสำหรับบันทึกใน responses (ไม่เก็บคำถาม แต่เก็บ embedding)
         response_data = {
             "user_id": user_id,
             "answer": answer,
@@ -143,6 +157,12 @@ def store_user_response(
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
+        
+        # 🆕 เพิ่ม embeddings ถ้าสร้างสำเร็จ
+        if question_embedding is not None:
+            response_data["question_embedding"] = question_embedding
+        if answer_embedding is not None:
+            response_data["answer_embedding"] = answer_embedding
         
         # เพิ่มข้อมูลบริบทถ้ามี
         if context_data:
@@ -294,6 +314,8 @@ def get_user_context(user_id: str):
                 "last_response_type": latest_response.get("response_type"),
                 "last_response_time": latest_response.get("created_at")
             })
+            # 🆕 เก็บ response object ไว้เพื่อใช้ embeddings (ถ้ามี)
+            context["_last_response_obj"] = latest_response
         
         # ข้อมูลการสนทนาหลายครั้งล่าสุด
         if all_responses:
@@ -789,10 +811,185 @@ def get_summary_content(doc_id, collection_name):
 
 # ฟังก์ชัน add_supplementary_info ถูกลบออกแล้วเนื่องจากไม่ใช้งาน
 
-# ✔️ ทำ Retrieval Phase และถาม GPT พร้อม Western Astrology Context
+# 🆕 ฟังก์ชันคำนวณ Semantic Similarity สำหรับ Follow-up Detection
+def calculate_semantic_similarity(text1: str, text2: str, model=None) -> float:
+    """
+    คำนวณ semantic similarity ระหว่างสองข้อความโดยใช้ embedding model
+    
+    Args:
+        text1 (str): ข้อความแรก
+        text2 (str): ข้อความที่สอง
+        model: SentenceTransformer model (ถ้า None จะสร้างใหม่)
+        
+    Returns:
+        float: similarity score (0-1, ยิ่งสูงยิ่งคล้ายกัน)
+    """
+    try:
+        import numpy as np
+        
+        # โหลด embedding model ถ้ายังไม่มี
+        if model is None:
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+        
+        # สร้าง embeddings
+        embedding1 = model.encode(text1, convert_to_numpy=True)
+        embedding2 = model.encode(text2, convert_to_numpy=True)
+        
+        # คำนวณ cosine similarity
+        similarity = np.dot(embedding1, embedding2) / (
+            np.linalg.norm(embedding1) * np.linalg.norm(embedding2)
+        )
+        
+        return float(similarity)
+        
+    except Exception as e:
+        logger.warning(f"Error calculating semantic similarity: {e}")
+        return 0.0
+
+# ✔️ ตรวจสอบคำถามต่อเนื่องด้วย Semantic Similarity (แทน LLM)
+def check_follow_up_question_with_semantic_similarity(
+    question: str, 
+    user_context: dict = None,
+    similarity_threshold: float = 0.25
+) -> Tuple[bool, float]:
+    """
+    ตรวจสอบว่าเป็นคำถามต่อเนื่องหรือไม่โดยใช้ Semantic Similarity
+    
+    ใช้ embedding model เพื่อคำนวณความคล้ายคลึงทางความหมายระหว่าง:
+    - คำถามปัจจุบัน กับ คำถามก่อนหน้า
+    - คำถามปัจจุบัน กับ คำตอบก่อนหน้า
+    - คำถามปัจจุบัน กับ บริบทการสนทนา (คำถาม + คำตอบ)
+    
+    Args:
+        question (str): คำถามปัจจุบัน
+        user_context (dict): ข้อมูลบริบทของผู้ใช้
+        similarity_threshold (float): threshold สำหรับตัดสินว่าเป็น follow-up (default: 0.25)
+        
+    Returns:
+        tuple[bool, float]: (is_follow_up, max_similarity_score)
+            - is_follow_up: True ถ้าเป็นคำถามต่อเนื่อง
+            - max_similarity_score: similarity score สูงสุดที่คำนวณได้
+    """
+    try:
+        # ถ้าไม่มีบริบทการสนทนา ให้ถือว่าไม่ใช่คำถามต่อเนื่อง
+        if not user_context or not user_context.get("last_question"):
+            return False, 0.0
+        
+        # ถ้ามีข้อมูลวันเกิดในคำถาม ให้ถือว่าไม่ใช่คำถามต่อเนื่อง
+        has_birth_date_in_question = any(pattern in question for pattern in [
+            "/", "-", ".", "เดือน", "ปี", "วันเกิด", "เกิด", "มกราคม", "กุมภาพันธ์", "มีนาคม", 
+            "เมษายน", "พฤษภาคม", "มิถุนายน", "กรกฎาคม", "สิงหาคม", "กันยายน", 
+            "ตุลาคม", "พฤศจิกายน", "ธันวาคม"
+        ])
+        
+        if has_birth_date_in_question:
+            return False, 0.0
+        
+        # โหลด embedding model
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        
+        # สร้าง embedding สำหรับคำถามปัจจุบัน
+        current_question_embedding = model.encode(question, convert_to_numpy=True)
+        
+        # ดึงข้อมูลบริบทก่อนหน้า
+        last_question = user_context.get("last_question", "")
+        last_response = user_context.get("last_response", "")
+        
+        # คำนวณ similarity scores หลายแบบ
+        similarities = []
+        
+        # 1. Similarity ระหว่างคำถามปัจจุบันกับคำถามก่อนหน้า
+        if last_question:
+            # 🆕 ใช้ embedding ที่เก็บไว้ถ้ามี (จาก responses collection)
+            last_response_obj = user_context.get("_last_response_obj")
+            if last_response_obj and "question_embedding" in last_response_obj:
+                # ใช้ embedding ที่เก็บไว้แล้ว
+                import numpy as np
+                last_question_embedding = np.array(last_response_obj["question_embedding"])
+                sim_with_last_question = float(np.dot(current_question_embedding, last_question_embedding) / (
+                    np.linalg.norm(current_question_embedding) * np.linalg.norm(last_question_embedding)
+                ))
+                logger.debug(f"✅ Used stored question embedding for similarity calculation")
+            else:
+                # สร้าง embedding ใหม่ถ้าไม่มี
+                sim_with_last_question = calculate_semantic_similarity(
+                    question, last_question, model
+                )
+            similarities.append(("last_question", sim_with_last_question))
+            logger.debug(f"Similarity with last question: {sim_with_last_question:.4f}")
+        
+        # 2. Similarity ระหว่างคำถามปัจจุบันกับคำตอบก่อนหน้า
+        if last_response:
+            # 🆕 ใช้ embedding ที่เก็บไว้ถ้ามี (จาก responses collection)
+            last_response_obj = user_context.get("_last_response_obj")
+            if last_response_obj and "answer_embedding" in last_response_obj:
+                # ใช้ embedding ที่เก็บไว้แล้ว
+                import numpy as np
+                last_answer_embedding = np.array(last_response_obj["answer_embedding"])
+                sim_with_last_response = float(np.dot(current_question_embedding, last_answer_embedding) / (
+                    np.linalg.norm(current_question_embedding) * np.linalg.norm(last_answer_embedding)
+                ))
+                logger.debug(f"✅ Used stored answer embedding for similarity calculation")
+            else:
+                # สร้าง embedding ใหม่ถ้าไม่มี (ใช้เฉพาะส่วนแรกเพื่อความเร็ว)
+                sim_with_last_response = calculate_semantic_similarity(
+                    question, last_response[:500], model
+                )
+            similarities.append(("last_response", sim_with_last_response))
+            logger.debug(f"Similarity with last response: {sim_with_last_response:.4f}")
+        
+        # 3. Similarity ระหว่างคำถามปัจจุบันกับบริบทรวม (คำถาม + คำตอบ)
+        if last_question and last_response:
+            context_text = f"{last_question} {last_response[:300]}"
+            sim_with_context = calculate_semantic_similarity(
+                question, context_text, model
+            )
+            similarities.append(("context", sim_with_context))
+            logger.debug(f"Similarity with context: {sim_with_context:.4f}")
+        
+        # 4. Similarity กับ recent conversations (ถ้ามี)
+        if user_context.get("recent_conversations"):
+            recent_convs = user_context["recent_conversations"][:3]  # เอาแค่ 3 อันล่าสุด
+            for i, conv in enumerate(recent_convs):
+                conv_text = f"{conv.get('question', '')} {conv.get('answer', '')[:200]}"
+                if conv_text.strip():
+                    sim_with_recent = calculate_semantic_similarity(
+                        question, conv_text, model
+                    )
+                    similarities.append((f"recent_conv_{i}", sim_with_recent))
+                    logger.debug(f"Similarity with recent conversation {i}: {sim_with_recent:.4f}")
+        
+        # หา similarity score สูงสุด
+        if not similarities:
+            return False, 0.0
+        
+        max_similarity = max(sim[1] for sim in similarities)
+        max_source = max(similarities, key=lambda x: x[1])[0]
+        
+        # ตัดสินว่าเป็น follow-up หรือไม่
+        is_follow_up = max_similarity >= similarity_threshold
+        
+        logger.info(
+            f"Semantic Similarity Check: '{question[:50]}...' -> "
+            f"Max similarity: {max_similarity:.4f} (source: {max_source}), "
+            f"Threshold: {similarity_threshold}, "
+            f"Is follow-up: {is_follow_up}"
+        )
+        
+        return is_follow_up, max_similarity
+        
+    except Exception as e:
+        logger.warning(f"Error in semantic similarity follow-up check: {e}")
+        # ถ้าเกิด error ให้ return False (ไม่ใช่ follow-up)
+        return False, 0.0
+
+# ✔️ ตรวจสอบคำถามต่อเนื่องด้วย LLM (OpenAI GPT)
 def check_follow_up_question_with_llm(question: str, user_context: dict = None) -> bool:
     """
-    ตรวจสอบว่าเป็นคำถามต่อเนื่องหรือไม่โดยใช้ LLM
+    ตรวจสอบว่าเป็นคำถามต่อเนื่องหรือไม่โดยใช้ LLM (OpenAI GPT)
+    
+    ใช้ LLM เพื่อวิเคราะห์ความเกี่ยวข้องระหว่างคำถามปัจจุบันกับบริบทการสนทนาก่อนหน้า
+    โดยส่งข้อมูล [last_question, last_response, Current question] ไปให้ LLM วิเคราะห์
     
     Args:
         question (str): คำถามปัจจุบัน
@@ -819,25 +1016,36 @@ def check_follow_up_question_with_llm(question: str, user_context: dict = None) 
         # ใช้ LLM เพื่อตรวจสอบความเกี่ยวข้อง
         from openai import OpenAI
         openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key or openai_key == "your-openai-api-key-here":
+            logger.warning("OpenAI API key not configured, falling back to semantic similarity")
+            # Fallback to semantic similarity if no API key
+            is_follow_up, _ = check_follow_up_question_with_semantic_similarity(
+                question, user_context, similarity_threshold=0.25
+            )
+            return is_follow_up
+        
         client = OpenAI(api_key=openai_key)
         
-        # สร้าง prompt สำหรับตรวจสอบความเกี่ยวข้อง
+        # ดึงข้อมูลบริบทก่อนหน้า
         last_question = user_context.get("last_question", "")
         last_response = user_context.get("last_response", "")
         
-        prompt = f"""คุณเป็นผู้เชี่ยวชาญในการวิเคราะห์ความเกี่ยวข้องของคำถาม
+        # สร้าง prompt สำหรับตรวจสอบความเกี่ยวข้อง
+        prompt = f"""คุณเป็นผู้เชี่ยวชาญในการวิเคราะห์ความเกี่ยวข้องของคำถามในบริบทการสนทนา
 
 คำถามก่อนหน้า: "{last_question}"
-คำตอบก่อนหน้า: "{last_response[:200]}..."
+คำตอบก่อนหน้า: "{last_response[:300]}..."
 คำถามปัจจุบัน: "{question}"
 
-กรุณาตอบว่า "YES" ถ้าคำถามปัจจุบันเกี่ยวข้องกับคำถามก่อนหน้า หรือ "NO" ถ้าไม่เกี่ยวข้อง
+กรุณาตอบว่า "YES" ถ้าคำถามปัจจุบันเกี่ยวข้องกับคำถามก่อนหน้าหรือคำตอบก่อนหน้า หรือ "NO" ถ้าไม่เกี่ยวข้อง
 
 เกณฑ์การตัดสิน:
 - ถ้าคำถามปัจจุบันถามเกี่ยวกับข้อมูลที่เกี่ยวข้องกับคำตอบก่อนหน้า = YES
+- ถ้าคำถามปัจจุบันถามต่อจากหัวข้อเดียวกัน (เช่น ถาม "ความรัก" แล้วถาม "งาน" ต่อ) = YES
 - ถ้าคำถามปัจจุบันถามเรื่องใหม่ที่ไม่เกี่ยวข้อง = NO
 - ถ้าคำถามปัจจุบันมีข้อมูลวันเกิดใหม่ = NO
 - ถ้าคำถามปัจจุบันถามต่อจากข้อมูลราศีที่ได้ = YES
+- ถ้าคำถามปัจจุบันเป็นคำถามทั่วไปที่อ้างอิงถึงข้อมูลก่อนหน้า = YES
 
 ตอบแค่ "YES" หรือ "NO" เท่านั้น:"""
         
@@ -846,25 +1054,34 @@ def check_follow_up_question_with_llm(question: str, user_context: dict = None) 
         response = client.chat.completions.create(
             model=openai_model,
             messages=[
-                {"role": "system", "content": "คุณเป็นผู้เชี่ยวชาญในการวิเคราะห์ความเกี่ยวข้องของคำถาม ตอบแค่ YES หรือ NO เท่านั้น"},
+                {"role": "system", "content": "คุณเป็นผู้เชี่ยวชาญในการวิเคราะห์ความเกี่ยวข้องของคำถามในบริบทการสนทนา ตอบแค่ YES หรือ NO เท่านั้น"},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1,
+            temperature=0.1,  # ใช้ temperature ต่ำเพื่อความสม่ำเสมอ
             max_tokens=10
         )
         
         result = response.choices[0].message.content.strip().upper()
         is_follow_up = result == "YES"
         
-        logger.info(f"LLM ตรวจสอบคำถามต่อเนื่อง: '{question}' -> {result} (เกี่ยวข้อง: {is_follow_up})")
+        logger.info(
+            f"LLM Follow-up Detection: '{question[:50]}...' -> {result} "
+            f"(is_follow_up: {is_follow_up})"
+        )
         
         return is_follow_up
         
     except Exception as e:
-        logger.warning(f"Error in LLM follow-up check: {e}")
-        # ถ้าเกิด error ให้ return False (ไม่ใช่ follow-up)
-        # เพื่อให้ระบบยังทำงานต่อได้ แม้ว่าจะไม่สามารถตรวจสอบ follow-up ได้
-        return False
+        logger.warning(f"Error in LLM follow-up check: {e}, falling back to semantic similarity")
+        # ถ้าเกิด error ให้ fallback ไปใช้ semantic similarity
+        try:
+            is_follow_up, _ = check_follow_up_question_with_semantic_similarity(
+                question, user_context, similarity_threshold=0.25
+            )
+            return is_follow_up
+        except:
+            # ถ้า semantic similarity ก็ error ให้ return False
+            return False
 
 def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_info: dict = None) -> str:
     # print(f"\n=== เริ่มการค้นหาข้อมูลสำหรับคำถาม: {question} ===")
@@ -878,8 +1095,9 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
     # ดึงข้อมูลบริบทการสนทนาของผู้ใช้ก่อน
     user_context = get_user_context(user_id)
     
-    # ตรวจสอบว่าเป็นคำถามต่อเนื่องหรือไม่โดยใช้ LLM
+    # ตรวจสอบว่าเป็นคำถามต่อเนื่องหรือไม่โดยใช้ LLM (ตาม diagram)
     is_follow_up_question = check_follow_up_question_with_llm(question, user_context)
+    logger.info(f"Follow-up detection (LLM): question='{question[:50]}...', is_follow_up={is_follow_up_question}")
     
     user_birth_date = user_context.get("birth_date") if user_context else None
     user_zodiac = user_context.get("zodiac_sign") if user_context else None
@@ -994,12 +1212,13 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
         query_embedding = model.encode(question)
         # print(f"สร้าง query embedding สำเร็จ (ขนาด: {len(query_embedding)})")
         
-        # ค้นหาจาก collections ที่บันทึกข้อมูลสรุปแล้วใน SUMMARY_DB_NAME (ใช้ summary embeddings)
+        # ✅ ค้นหาจาก processed collections ใน SUMMARY_DB_NAME เท่านั้น (ใช้ summary และ embeddings)
+        # ✅ ไม่ใช้ original collections (เก็บต้นฉบับเท่านั้น ไม่มี embeddings)
         # ต้องตรงกับชื่อ collection ที่ pipeline multimodel_rag สร้างไว้
         collections_to_search = [
-            "processed_text_chunks",
-            "processed_image_chunks",
-            "processed_table_chunks",
+            "processed_text_chunks",      # ✅ มี summary และ embeddings
+            "processed_image_chunks",     # ✅ มี summary, embeddings (text), และ image_embeddings
+            "processed_table_chunks",     # ✅ มี summary และ embeddings
         ]
         
         for collection_name in collections_to_search:
@@ -1017,11 +1236,12 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
                 # print(f"จำนวนเอกสารใน {collection_name}: {len(docs)}")
                 
                 if docs:
-                    # คำนวณ similarity scores (ใช้ summary embeddings)
+                    # ✅ คำนวณ similarity scores (ใช้ embeddings ที่สร้างจาก summary)
+                    # ✅ embeddings ใน processed chunks ถูกสร้างจาก summary text (ไม่ใช่ text ต้นฉบับ)
                     similarities = []
                     for doc in docs:
                         if 'embeddings' in doc:
-                            # embeddings ถูกสร้างจาก summary text
+                            # ✅ embeddings ถูกสร้างจาก summary text (ใน multimodel_rag.py)
                             doc_embedding = np.array(doc['embeddings'])
                             similarity = np.dot(query_embedding, doc_embedding) / (
                                 np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding)
@@ -1103,14 +1323,16 @@ def ask_question_to_rag(question: str, user_id: str = "unknown", provided_chart_
             return "ขออภัยค่ะ ตอนนี้ระบบยังไม่พร้อมใช้งาน AI ภายนอก แต่คุณสามารถถามเกี่ยวกับราศีได้ตามปกติ เช่น 'นิสัยราศีเมถุนเป็นยังไง' หรือ 'สีมงคลราศีสิงห์'"
         client = OpenAI(api_key=openai_key)
         
-        # สร้าง context จากเอกสารที่ค้นหาได้จาก astrobot_summary เท่านั้น
-        # ระบบใช้ summary embeddings ในการค้นหา และใช้ summary ในการสร้างคำตอบ
+        # ✅ สร้าง context จากเอกสารที่ค้นหาได้จาก processed collections เท่านั้น
+        # ✅ ระบบใช้ summary embeddings ในการค้นหา และใช้ summary ในการสร้างคำตอบ
+        # ✅ ไม่ใช้ original collections (ไม่มี embeddings)
         context_info = ""
         if retrieved_docs:
-            context_info = "\n\nข้อมูลที่เกี่ยวข้องจากฐานข้อมูล astrobot_summary (ใช้ summary embeddings):\n"
+            context_info = "\n\nข้อมูลที่เกี่ยวข้องจากฐานข้อมูล astrobot_summary (ใช้ summary และ embeddings):\n"
             for i, doc in enumerate(retrieved_docs):
                 if isinstance(doc, dict):
-                    # ใช้ summary เป็นหลัก (เพราะ embeddings ถูกสร้างจาก summary)
+                    # ✅ ใช้ summary เป็นหลัก (เพราะ embeddings ถูกสร้างจาก summary)
+                    # ✅ summary กระชับและมีความหมายมากกว่า text ต้นฉบับ
                     content_to_use = doc.get('summary', doc.get('text', ''))
                     context_info += f"{i+1}. {content_to_use[:300]}...\n"
                     

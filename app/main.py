@@ -19,7 +19,6 @@ from linebot.v3.messaging import (
 
 from .response_message import generate_reply_message
 from .retrieval_utils import ask_question_to_rag, store_user_response, store_user_question, check_and_update_question_limit
-from .quick_reply import handle_quick_reply
 from .content_filter import check_content_safety
 
 app = FastAPI()
@@ -59,18 +58,7 @@ def on_message_event(event: MessageEvent):
     with ApiClient(configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
 
-        # ✅ ลองให้ quick reply ทำงานก่อน
-        quick_reply = handle_quick_reply(event)
-        if quick_reply:
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[quick_reply]
-                )
-            )
-            return
-
-        # ถ้าไม่ใช่ quick reply: ตอบกลับสถานะกำลังประมวลผลก่อน แล้วค่อย push คำตอบสุดท้าย
+        # ตอบกลับสถานะกำลังประมวลผลก่อน แล้วค่อย push คำตอบสุดท้าย
         try:
             # ตอบกลับทันทีเพื่อแจ้งสถานะกำลังประมวลผล
             processing_msg = TextMessage(text="กำลังประมวลผลคำตอบอยู่... โปรดรอสักครู่ค่ะ")
